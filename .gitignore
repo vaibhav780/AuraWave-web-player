@@ -1,0 +1,37 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# ---- Virtual environments ----
+.venv/
+venv/
+env/
+ENV/
+
+# ---- AuraWave runtime data (regenerated automatically) ----
+library.db
+library.db-journal
+library.db-wal
+art_cache/
+lyrics_cache/
+
+# ---- Local music / media (never commit someone's library) ----
+*.mp3
+*.flac
+*.wav
+*.m4a
+*.aac
+*.ogg
+metadata.json
+
+# ---- Backups / archives ----
+*.zip
+
+# ---- Editors / OS ----
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

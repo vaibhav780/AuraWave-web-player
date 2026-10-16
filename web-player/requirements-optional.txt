@@ -1,0 +1,22 @@
+# AuraWave Web Player — OPTIONAL dependencies
+# ------------------------------------------------------------------
+# The web player runs with the Python standard library alone. These
+# packages only *enhance* it; everything degrades gracefully without
+# them (the server reports what's available at GET /capabilities and
+# prints it in the startup banner).
+#
+#   pip install -r requirements-optional.txt
+#
+# mutagen  -> read embedded tags (year/genre/duration/etc.) AND enable
+#             the in-browser tag + cover-art editor (POST /edit-tags,
+#             /edit-art). Without it, metadata comes from metadata.json
+#             and the editor is disabled.
+# watchdog -> instant live folder watching (auto-rescan on add/remove/
+#             change). Without it, a stdlib polling thread (every 5s)
+#             provides the same behaviour.
+#
+# Note: SQLite indexing + FTS5 full-text search and local scrobbling
+# use Python's built-in sqlite3 — no extra install required.
+
+mutagen>=1.45
+watchdog>=3.0

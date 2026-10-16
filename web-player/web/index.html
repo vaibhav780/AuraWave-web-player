@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0E0F11">
+  <title>AuraWave — Web Player</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%8E%B5%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <!-- ======================= Sidebar ======================= -->
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <span class="brand-logo">🎵</span>
+      <span class="brand-name">Aura<span class="accent">Wave</span></span>
+    </div>
+
+    <nav class="nav">
+      <button class="nav-item active" data-view="library">
+        <span class="ic">♫</span> Library <span class="badge" id="count-library">0</span>
+      </button>
+      <button class="nav-item" data-view="songs">
+        <span class="ic">🎵</span> Songs <span class="badge" id="count-songs">0</span>
+      </button>
+      <button class="nav-item" data-view="albums">
+        <span class="ic">💿</span> Albums <span class="badge" id="count-albums">0</span>
+      </button>
+      <button class="nav-item" data-view="artists">
+        <span class="ic">🎤</span> Artists <span class="badge" id="count-artists">0</span>
+      </button>
+      <button class="nav-item" data-view="years">
+        <span class="ic">📅</span> Years <span class="badge" id="count-years">0</span>
+      </button>
+      <button class="nav-item" data-view="favorites">
+        <span class="ic">♥</span> Favorites <span class="badge" id="count-favorites">0</span>
+      </button>
+      <button class="nav-item" data-view="recent">
+        <span class="ic">⟳</span> Recently Played <span class="badge" id="count-recent">0</span>
+      </button>
+      <button class="nav-item" data-view="stats">
+        <span class="ic">📊</span> Stats
+      </button>
+    </nav>
+
+    <div class="nav-section-title">
+      Playlists
+      <span class="nav-section-actions">
+        <button class="icon-btn small" id="btn-import-playlists" title="Import .m3u/.pls from the music folder">⤓</button>
+        <button class="icon-btn small" id="btn-new-playlist" title="New playlist">＋</button>
+      </span>
+    </div>
+    <nav class="nav playlists" id="playlist-nav"></nav>
+
+    <div class="sidebar-footer">
+      <button class="ghost-btn" id="btn-autoplay">📻 Autoplay radio: Off</button>
+      <button class="ghost-btn" id="btn-qr">📱 Open on phone (QR)</button>
+      <button class="ghost-btn" id="btn-theme">🌓 Toggle theme</button>
+    </div>
+  </aside>
+  <div class="scrim" id="scrim"></div>
+
+  <!-- ======================= Main ======================= -->
+  <main class="main">
+    <header class="topbar">
+      <button class="icon-btn menu-btn" id="btn-menu" title="Menu">☰</button>
+
+      <div class="server-box">
+        <input id="server-url" class="server-input" type="text"
+               placeholder="http://server:8000/  (leave blank to use this server)">
+        <button class="primary-btn" id="btn-connect">Connect</button>
+      </div>
+
+      <div class="search-box">
+        <span class="search-ic">🔎</span>
+        <input id="search" class="search-input" type="search" placeholder="Search title, artist, album…">
+        <button class="icon-btn small" id="btn-clear-search" title="Clear" hidden>✕</button>
+      </div>
+    </header>
+
+    <div class="toolbar">
+      <h1 class="view-title" id="view-title">Library</h1>
+      <div class="toolbar-controls">
+        <label class="select-wrap">Sort
+          <select id="sort-select"></select>
+        </label>
+        <label class="select-wrap">Group
+          <select id="group-select"></select>
+        </label>
+        <button class="chip-btn" id="btn-play-all" title="Play all">▶ Play all</button>
+        <button class="chip-btn" id="btn-shuffle-all" title="Shuffle all">🔀 Shuffle</button>
+      </div>
+    </div>
+
+    <div class="tabs" id="library-tabs" hidden></div>
+
+    <section class="song-scroll" id="song-scroll">
+      <div id="song-list" class="song-list"></div>
+      <div id="empty-state" class="empty-state" hidden></div>
+    </section>
+  </main>
+
+  <!-- ======================= Now-playing bar ======================= -->
+  <footer class="nowbar" id="nowbar">
+    <div class="np-seek">
+      <span class="t" id="np-cur">0:00</span>
+      <input class="seek" id="seek" type="range" min="0" max="1000" value="0" step="1">
+      <span class="t" id="np-dur">0:00</span>
+    </div>
+    <div class="nowbar-row">
+      <div class="np-meta" id="np-open">
+        <div class="np-art" id="np-art">🎵</div>
+        <div class="np-text">
+          <div class="np-title" id="np-title">Nothing playing</div>
+          <div class="np-sub" id="np-sub">Pick a track to start</div>
+        </div>
+        <button class="icon-btn fav-btn" id="np-fav" title="Favorite">♡</button>
+        <button class="icon-btn" id="np-edit" title="Edit tags & cover art" hidden>✎</button>
+      </div>
+
+      <div class="np-controls">
+        <button class="icon-btn" id="btn-shuffle" title="Shuffle">🔀</button>
+        <button class="icon-btn" id="btn-prev" title="Previous">⏮</button>
+        <button class="icon-btn play" id="btn-play" title="Play/Pause">▶</button>
+        <button class="icon-btn" id="btn-next" title="Next">⏭</button>
+        <button class="icon-btn" id="btn-repeat" title="Repeat">🔁</button>
+      </div>
+
+      <div class="np-extra">
+        <button class="icon-btn" id="btn-speed" title="Playback speed">1.0×</button>
+        <button class="icon-btn" id="btn-lyrics" title="Lyrics">🎙</button>
+        <button class="icon-btn" id="btn-eq" title="Equalizer & effects">🎛</button>
+        <button class="icon-btn" id="btn-queue" title="Queue">📑</button>
+        <div class="vol-wrap">
+          <span class="vol-ic" id="vol-ic">🔊</span>
+          <input class="vol" id="vol" type="range" min="0" max="100" value="100">
+        </div>
+      </div>
+    </div>
+  </footer>
+
+  <!-- ======================= Full-page Now Playing ======================= -->
+  <section class="now-page" id="now-page" hidden aria-hidden="true">
+    <div class="np-page-top">
+      <button class="icon-btn" id="np-page-close" title="Close">▾</button>
+      <span class="np-page-heading">Now Playing</span>
+    </div>
+    <div class="np-page-grid">
+      <div class="np-page-main">
+        <div class="np-page-art" id="np-page-art">🎵</div>
+        <div class="np-page-info">
+          <div class="np-page-title" id="np-page-title">Nothing playing</div>
+          <div class="np-page-artist" id="np-page-artist"></div>
+          <div class="np-page-album" id="np-page-album"></div>
+        </div>
+        <div class="np-page-label">Equalizer</div>
+        <div class="np-page-slot" id="np-viz-slot"></div>
+      </div>
+      <div class="np-page-side">
+        <div class="np-page-label">Lyrics</div>
+        <div class="np-page-sec" id="np-lyrics-slot"></div>
+        <div class="np-page-label">Sound Effects</div>
+        <div class="np-page-sec" id="np-fx-slot"></div>
+      </div>
+    </div>
+  </section>
+
+  <audio id="audio" crossorigin="anonymous" preload="auto"></audio>
+  <audio id="audio2" crossorigin="anonymous" preload="auto"></audio>
+
+  <!-- ======================= Equalizer / effects panel ======================= -->
+  <div class="panel-scrim" id="eq-scrim" hidden></div>
+  <section class="panel eq-panel" id="eq-panel" hidden aria-hidden="true">
+    <div class="panel-head">
+      <h2>Equalizer &amp; Effects</h2>
+      <div class="panel-head-actions">
+        <label class="switch"><input type="checkbox" id="eq-enabled" checked><span></span> EQ</label>
+        <button class="icon-btn" id="eq-close" title="Close">✕</button>
+      </div>
+    </div>
+
+    <div class="viz-wrap" id="viz-wrap">
+      <canvas id="viz-canvas"></canvas>
+      <div class="viz-overlay">
+        <span class="viz-eqbadge">🎚 BEAT</span>
+        <span class="viz-track" id="viz-track">Press play to see the beat</span>
+      </div>
+      <div class="viz-tools">
+        <button class="viz-tool" id="viz-style" title="Change animation style">🎨 Bars</button>
+        <button class="viz-tool" id="viz-enlarge" title="Toggle large size">⤢ Enlarge</button>
+        <button class="viz-tool" id="viz-fs" title="Full screen">⛶ Full screen</button>
+      </div>
+      <div class="viz-resize-hint" title="Drag to resize"></div>
+    </div>
+
+    <div class="eq-presets" id="eq-presets"></div>
+
+    <div class="eq-bands" id="eq-bands"></div>
+
+    <div class="fx-grid" id="fx-grid">
+      <div class="fx">
+        <label>Reverb</label>
+        <select id="fx-reverb"></select>
+      </div>
+      <div class="fx">
+        <label>Stereo Widen <span id="fx-wide-val">0</span></label>
+        <input type="range" id="fx-wide" min="0" max="100" value="0">
+      </div>
+      <div class="fx">
+        <label>X-Bass <span id="fx-bass-val">0</span></label>
+        <input type="range" id="fx-bass" min="0" max="100" value="0">
+      </div>
+      <div class="fx">
+        <label>X-Surround <span id="fx-surround-val">0</span></label>
+        <input type="range" id="fx-surround" min="0" max="100" value="0">
+      </div>
+      <div class="fx">
+        <label>Headphone Crossfeed <span id="fx-crossfeed-val">0</span></label>
+        <input type="range" id="fx-crossfeed" min="0" max="100" value="0">
+      </div>
+      <div class="fx">
+        <label>Speed <span id="fx-speed-val">1.0×</span></label>
+        <input type="range" id="fx-speed" min="50" max="200" value="100" step="5">
+      </div>
+      <div class="fx">
+        <label>Crossfade <span id="fx-crossfade-val">Off</span></label>
+        <input type="range" id="fx-crossfade" min="0" max="12" value="0" step="1">
+      </div>
+      <div class="fx">
+        <label class="switch"><input type="checkbox" id="fx-normalize"><span></span> Normalize volume</label>
+      </div>
+      <div class="fx fx-pitch">
+        <label class="switch"><input type="checkbox" id="fx-pitch" checked><span></span> Preserve pitch</label>
+        <button class="ghost-btn tiny" id="fx-reset">Reset all</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= Queue panel ======================= -->
+  <section class="panel queue-panel" id="queue-panel" hidden aria-hidden="true">
+    <div class="panel-head">
+      <h2>Queue <span class="badge" id="queue-count">0</span></h2>
+      <div class="panel-head-actions">
+        <button class="ghost-btn tiny" id="queue-clear" title="Clear the whole queue">🗑 Clear queue</button>
+        <button class="icon-btn" id="queue-close" title="Close this window">✕</button>
+      </div>
+    </div>
+    <div class="queue-list" id="queue-list"></div>
+  </section>
+
+  <!-- ======================= Lyrics panel ======================= -->
+  <section class="panel lyrics-panel" id="lyrics-panel" hidden aria-hidden="true">
+    <div class="panel-head">
+      <h2>Lyrics</h2>
+      <button class="icon-btn" id="lyrics-close" title="Close">✕</button>
+    </div>
+    <div class="lyrics-body" id="lyrics-body"></div>
+  </section>
+
+  <!-- Generic prompt/confirm modal -->
+  <div class="modal-scrim" id="modal-scrim" hidden>
+    <div class="modal" id="modal">
+      <h3 id="modal-title">Title</h3>
+      <p id="modal-body"></p>
+      <input type="text" id="modal-input" hidden>
+      <div class="modal-list" id="modal-list" hidden></div>
+      <div class="modal-actions">
+        <button class="ghost-btn" id="modal-cancel">Cancel</button>
+        <button class="primary-btn" id="modal-ok">OK</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Tag & cover-art editor modal -->
+  <div class="modal-scrim" id="tag-scrim" hidden>
+    <div class="modal tag-modal" id="tag-modal">
+      <h3>Edit track</h3>
+      <div class="tag-grid">
+        <label>Title <input type="text" id="tag-title"></label>
+        <label>Artist <input type="text" id="tag-artist"></label>
+        <label>Album <input type="text" id="tag-album"></label>
+        <label>Album Artist <input type="text" id="tag-albumArtist"></label>
+        <label>Year <input type="text" id="tag-year" inputmode="numeric"></label>
+        <label>Genre <input type="text" id="tag-genre"></label>
+        <label>Music Director <input type="text" id="tag-musicDirector"></label>
+        <label>Cover art <input type="file" id="tag-art" accept="image/*"></label>
+      </div>
+      <div class="modal-actions">
+        <button class="ghost-btn" id="tag-cancel">Cancel</button>
+        <button class="primary-btn" id="tag-save">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast" hidden></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

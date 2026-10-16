@@ -1,0 +1,8 @@
+# AuraWave Desktop Music Server — dependencies
+# Python 3.9+ recommended (tested on 3.12)
+
+customtkinter==5.2.2   # modern dark/light Tkinter-based GUI
+Flask==3.0.3           # lightweight HTTP + JSON API framework
+waitress==3.0.0        # production-grade, pure-Python WSGI server (Windows-friendly)
+qrcode==7.4.2          # generates the "scan to connect" QR code (pure-Python, no Pillow needed)
+mutagen==1.47.0        # reads embedded audio tags (year / composer / genre / track number)
