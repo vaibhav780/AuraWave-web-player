@@ -1,120 +1,313 @@
-# AuraWave 🎵
+<div align="center">
 
-Self-hosted, local Wi-Fi music streaming — no cloud, no account, no subscription.
-Point a small Python server at a folder of your music and play it from any web
-browser on the same network, with lossless (FLAC/WAV) instant seeking via HTTP
-range requests.
+# 🌊 AuraWave
 
-This repository contains two independent, complementary servers:
+### Your music. Your network. Your rules.
 
-| Folder | What it is | Stack | Default port |
-|--------|-----------|-------|:---:|
-| [`web-player/`](web-player/) | A full **browser music player** + streaming server. Dependency-light (standard library; a few optional extras unlock more). | Python stdlib + static HTML/CSS/JS | **8000** |
-| [`desktop-server/`](desktop-server/) | A **GUI streaming server** with a live connected-devices panel. Also serves the web player at `/player/`. | CustomTkinter + Flask/waitress | **8080** |
+**A self-hosted, local Wi-Fi music-streaming ecosystem** — stream your own library
+to any browser on your network. No cloud, no accounts, no subscriptions, no ads.
 
-They can run at the same time (different ports), and the desktop server reuses the
-web player's UI from the sibling `web-player/web` folder.
+<br/>
 
----
+[![Python](https://img.shields.io/badge/Python-3.8%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
+[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-0A7E8C?style=for-the-badge)](#)
+[![Web Audio](https://img.shields.io/badge/Audio-Web%20Audio%20API-1ED760?style=for-the-badge&logo=webassembly&logoColor=white)](#)
+[![Status](https://img.shields.io/badge/Status-Active-brightgreen?style=for-the-badge)](#)
+[![PRs](https://img.shields.io/badge/PRs-welcome-17C9C0?style=for-the-badge)](#)
 
-## Features
+<br/>
 
-**Playback & library**
-- Library with **live search**, sort and group; a dedicated **Songs** (all-tracks) tab;
-  **Albums / Artists / Years** browsing; Favorites, Recently Played and Playlists.
-- Queue with non-repeating **shuffle** and **repeat OFF / ALL / ONE**.
-- **Dual-deck** audio engine for true **crossfade / gapless** playback.
-- Instant seeking on FLAC/WAV (HTTP Range `206`), permissive CORS, path-traversal-safe.
+[**Features**](#-features) ·
+[**Quick Start**](#-quick-start) ·
+[**Screenshots**](#-screenshots) ·
+[**Architecture**](#-architecture) ·
+[**Configuration**](#️-configuration) ·
+[**FAQ**](#-faq)
 
-**Audio effects (Web Audio, client-side)**
-- 10-band **graphic equalizer** with JetAudio-style genre presets **and** a
-  **parametric EQ** mode (per-band frequency / Q / shelving).
-- **Headphone crossfeed** (BS2B-style), reverb (Room/Hall/Stadium), stereo-widen,
-  X-Bass, X-Surround, playback speed 0.5×–2.0× (pitch-preserving), loudness
-  normalization, and a 4-style visualizer.
-
-**Library management & data (web-player server)**
-- **Live folder watcher** — auto re-index when files are added/removed/changed
-  (uses `watchdog` if installed, else a stdlib polling fallback).
-- **SQLite index** with **FTS5 full-text search** — fast search on large libraries,
-  and a metadata cache so re-scans skip re-parsing unchanged files.
-- **In-browser tag & cover-art editor** (requires `mutagen`).
-- **M3U / PLS** playlist **import & export**.
-- **Local scrobbling + a Stats view** (top tracks/artists, listening time); optional
-  Last.fm push.
-
-**Lyrics & artwork**
-- Synced `.lrc` / plain-text lyrics from local sidecars or the free LRCLIB API.
-- Album artwork fetched and cached server-side, plus embedded-cover support.
+</div>
 
 ---
 
-## Quick start
+## ✨ What is AuraWave?
 
-> Requires **Python 3.8+**. Everything core runs on the standard library.
+AuraWave turns a folder of music on your PC into a polished, full-featured music
+player you can open in **any browser** — your phone, tablet, or another laptop — as
+long as it's on the same Wi-Fi. Lossless **FLAC/WAV** files seek instantly thanks to
+HTTP range streaming, and a rich **Web Audio** effects engine (equalizer, crossfeed,
+reverb and more) runs entirely in the browser.
 
-### Web player (fastest)
+This repository ships **two complementary servers**:
+
+<table>
+<tr>
+<td width="50%" valign="top">
+
+### 🎧 `web-player/`
+A **browser music player + streaming server**.
+Dependency-light (Python standard library), with optional extras that unlock the
+tag editor and instant folder-watching.
+
+**Default port:** `8000`
+
+</td>
+<td width="50%" valign="top">
+
+### 🖥️ `desktop-server/`
+A **GUI streaming server** with a live connected-devices panel. Also serves the web
+player UI at `/player/`.
+
+**Default port:** `8080`
+
+</td>
+</tr>
+</table>
+
+> They can run side by side (different ports), and the desktop server reuses the web
+> player's UI from the sibling `web-player/web` folder.
+
+---
+
+## 🚀 Features
+
+### 🎵 Playback & Library
+- 🔎 **Live search**, sort, and group — with a dedicated **Songs** (all-tracks) tab
+- 💿 Browse by **Albums / Artists / Years**, plus **Favorites**, **Recently Played** & **Playlists**
+- 🔀 Queue with non-repeating **shuffle** and **repeat** (Off / All / One)
+- 🎚️ **Dual-deck engine** for true **crossfade / gapless** playback
+- ⚡ **Instant seeking** on FLAC/WAV (HTTP Range `206`) with permissive CORS
+
+### 🎛️ Audio Effects *(Web Audio, client-side)*
+- 🎚️ **10-band graphic EQ** with genre presets **+** a **parametric EQ** (per-band frequency / Q / shelving)
+- 🎧 **Headphone crossfeed** (BS2B-style) for natural headphone listening
+- 🌈 Reverb (Room / Hall / Stadium), **stereo-widen**, **X-Bass**, **X-Surround**
+- ⏩ Playback speed **0.5×–2.0×** (pitch-preserving) + loudness **normalization**
+- 📊 A **4-style audio visualizer** (Bars / Mirror / Rainbow / Wave)
+
+### 🗂️ Library Management & Data *(web-player server)*
+- 👀 **Live folder watcher** — auto re-index on add/remove/change (`watchdog`, or a stdlib polling fallback)
+- 🗃️ **SQLite index** with **FTS5 full-text search** + a metadata cache so re-scans skip unchanged files
+- ✏️ **In-browser tag & cover-art editor** *(requires `mutagen`)*
+- 📜 **M3U / PLS** playlist **import & export**
+- 📈 **Local scrobbling** + a **Stats** view (top tracks/artists, listening time) — optional Last.fm push
+
+### 🎤 Lyrics & Artwork
+- 🎼 Synced `.lrc` / plain-text lyrics from local sidecars or the free **LRCLIB** API
+- 🖼️ Album artwork fetched & cached server-side, plus embedded-cover support
+
+### 📱 Connect in Seconds
+- 📷 **QR code** — open `/qr`, scan with your phone, start playing
+- 🎛️ **OS media controls / media keys** via the Media Session API
+- 🌓 **Light / dark** theme, fully responsive
+
+---
+
+## 📸 Screenshots
+
+> _Add your own screenshots here!_ Drop images into a `docs/` folder and reference them, e.g.:
+>
+> ```md
+> ![Library](docs/library.png)
+> ![Now Playing + EQ](docs/equalizer.png)
+> ![Stats](docs/stats.png)
+> ```
+
+<div align="center">
+
+| Library | Equalizer | Stats |
+|:---:|:---:|:---:|
+| _coming soon_ | _coming soon_ | _coming soon_ |
+
+</div>
+
+---
+
+## ⚡ Quick Start
+
+> **Requirements:** Python **3.8+**. The core runs on the standard library alone.
+
+<details open>
+<summary><b>🎧 Web player (fastest — no install)</b></summary>
 
 ```bash
 cd web-player
 python web_player.py --dir "C:\path\to\your\Music"
-# then open the printed URL, e.g. http://localhost:8000/
+# open the printed URL, e.g. http://localhost:8000/
 ```
 
-Optional extras (richer tags + the tag editor, and instant folder-watch):
+Optional extras — richer tags + the in-browser tag editor, and instant folder-watch:
 
 ```bash
 pip install -r web-player/requirements-optional.txt   # mutagen + watchdog
 ```
 
-### Desktop GUI server
+</details>
+
+<details>
+<summary><b>🖥️ Desktop GUI server</b></summary>
 
 ```bash
 cd desktop-server
 python -m venv .venv
-# Windows:
-.venv\Scripts\activate
+.venv\Scripts\activate          # Windows  (use: source .venv/bin/activate on macOS/Linux)
 pip install -r requirements.txt
-python app.py            # serves on http://localhost:8080  (browser UI at /player/)
+python app.py                   # http://localhost:8080  (browser player at /player/)
 ```
 
-On a phone: open `http://<your-lan-ip>:<port>/qr` and scan the QR, or just type the
-URL. Both devices must be on the same Wi-Fi.
+</details>
+
+<details>
+<summary><b>📱 Open it on your phone</b></summary>
+
+1. Make sure your phone and PC are on the **same Wi-Fi**.
+2. On the PC, open `http://<your-lan-ip>:<port>/qr`.
+3. **Scan the QR code** — or just type the URL into your phone's browser.
+
+</details>
 
 ---
 
-## Repository layout
+## 🏗️ Architecture
+
+```
+          ┌───────────────────────────────────────────────┐
+          │                  Your PC (LAN)                  │
+          │                                                 │
+          │   🎵 Music folder ──►  AuraWave server          │
+          │                         • /songs.json catalog   │
+          │                         • /stream  (range 206)  │
+          │                         • /search  (SQLite FTS) │
+          │                         • /art · /lyrics · /qr  │
+          │                         • /stats · /scrobble    │
+          └───────────────┬─────────────────┬───────────────┘
+                          │   HTTP / Wi-Fi  │
+              ┌───────────▼──┐         ┌─────▼──────────────┐
+              │  📱 Browser  │         │  💻 Browser        │
+              │  (phone)     │         │  (another PC)      │
+              └──────────────┘         └────────────────────┘
+```
+
+**How it works:** the server scans your folder into a catalog (cached in SQLite),
+serves audio with byte-range support, and ships a static browser UI. All audio
+effects run **client-side** in the browser via the Web Audio API — the server just
+streams bytes.
+
+---
+
+## 🧰 Tech Stack
+
+| Layer | Technology |
+|-------|-----------|
+| **Server (web-player)** | Python standard library · `sqlite3` + **FTS5** · optional `mutagen`, `watchdog` |
+| **Server (desktop)** | **Flask** + **waitress** · **CustomTkinter** GUI |
+| **Frontend** | Vanilla **HTML / CSS / JavaScript** · **Web Audio API** · Media Session API |
+| **Data** | JSON catalog · embedded **SQLite** index · local `.lrc` / artwork caches |
+
+---
+
+## 📁 Project Structure
 
 ```
 AuraWave/
-├─ README.md               ← you are here
-├─ PUBLISH.md              ← how this repo was published (git/GitHub steps)
+├─ README.md                   ← you are here
+├─ PUBLISH.md                  ← how to publish this repo (git/GitHub steps)
 ├─ .gitignore
-├─ web-player/             ← browser player + streaming server (port 8000)
-│  ├─ web_player.py
+│
+├─ web-player/                 🎧 browser player + streaming server (port 8000)
+│  ├─ web_player.py            ← the HTTP server (catalog, streaming, APIs)
 │  ├─ requirements-optional.txt
-│  ├─ run.bat / run.sh
-│  └─ web/ (index.html, app.js, styles.css)
-└─ desktop-server/         ← GUI streaming server (port 8080)
+│  ├─ run.bat · run.sh
+│  └─ web/
+│     ├─ index.html            ← UI shell
+│     ├─ app.js                ← all player logic (library, queue, effects…)
+│     └─ styles.css            ← emerald/teal theme
+│
+└─ desktop-server/             🖥️ GUI streaming server (port 8080)
    ├─ app.py
    ├─ requirements.txt
    └─ run.bat
 ```
 
-Each subfolder has its own README with details and options.
+Each subfolder has its own README with deeper details.
 
 ---
 
-## Notes
+## ⚙️ Configuration
 
-- Audio effects need the **Web Audio API** (all modern browsers); without it,
-  playback still works and effects become no-ops.
-- Your music files, the SQLite index (`library.db`), and the artwork/lyrics caches
-  are **git-ignored** — the repo ships code only, never your library.
-- This is a LAN tool: it binds `0.0.0.0` by default so other devices on your network
-  can reach it. Only run it on networks you trust.
+Common `web_player.py` command-line options:
 
-## License
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--dir`, `-d` | Folder of music to serve | current directory |
+| `--port`, `-p` | Port to listen on | `8000` |
+| `--host` | Interface to bind | `0.0.0.0` (all) |
+| `--db` | SQLite index / scrobble DB path | `./library.db` |
+| `--no-watch` | Disable the live folder watcher | watcher on |
+| `--no-online-art` | Don't download album artwork | art on |
+| `--no-online-lyrics` | Don't fetch lyrics from LRCLIB | lyrics on |
+| `--lastfm-key/-secret/-session` | Optional Last.fm scrobble push | local only |
 
-Add a license of your choice (e.g. MIT) as a `LICENSE` file if you intend others to
-use it.
+> Run `python web_player.py --help` for the full list.
+
+---
+
+## ❓ FAQ
+
+<details>
+<summary><b>Do I need an internet connection?</b></summary>
+
+No — streaming is fully local. The internet is only used (optionally) to fetch album
+artwork and lyrics the first time, which are then cached on disk.
+</details>
+
+<details>
+<summary><b>Will it use my data / upload my music anywhere?</b></summary>
+
+Never. Your library stays on your machine. The repo even git-ignores media files,
+the SQLite index and caches so nothing private is ever committed.
+</details>
+
+<details>
+<summary><b>Can I edit song tags from the browser?</b></summary>
+
+Yes — install <code>mutagen</code> (<code>pip install -r web-player/requirements-optional.txt</code>)
+and an ✏️ editor appears on each track for Title/Artist/Album/Year/etc. and cover art.
+</details>
+
+<details>
+<summary><b>It works but there's no sound from the effects?</b></summary>
+
+Effects need the <b>Web Audio API</b> (every modern browser has it). Audio still
+plays without it; the effects simply become no-ops.
+</details>
+
+---
+
+## 🔒 Security Note
+
+AuraWave is a **LAN tool** — it binds `0.0.0.0` so other devices on your network can
+reach it. File access is sandboxed to your chosen music folder (path-traversal safe).
+Only run it on networks you trust.
+
+---
+
+## 🤝 Contributing
+
+Issues and pull requests are welcome! Fork the repo, create a feature branch, and
+open a PR with a clear description.
+
+---
+
+## 📄 License
+
+No license file is included yet. If you want others to use, modify, or distribute
+AuraWave, add a `LICENSE` (e.g. [MIT](https://choosealicense.com/licenses/mit/)).
+
+---
+
+<div align="center">
+
+**Made with 🎵 for people who love their own music libraries.**
+
+⭐ If you find AuraWave useful, consider starring the repo!
+
+</div>
