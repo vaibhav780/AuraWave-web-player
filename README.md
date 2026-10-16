@@ -290,7 +290,7 @@ Only run it on networks you trust.
 
 ---
 
-## 🤝 Contributing
+## 🤝 Contributing vaibhav M
 
 Issues and pull requests are welcome! Fork the repo, create a feature branch, and
 open a PR with a clear description.
