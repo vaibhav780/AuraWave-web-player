@@ -656,3 +656,40 @@ input[type="range"]::-moz-range-thumb {
 .stat-main em::before { content: " — "; }
 .stat-count { color: var(--green); font-weight: 800; font-variant-numeric: tabular-nums; }
 .stat-empty { color: var(--text-faint); font-size: 13px; padding: 6px 0; }
+
+/* ---- Loading skeletons (shown while the catalog loads) ---- */
+.song-row.skeleton { pointer-events: none; }
+.song-row.skeleton .sk {
+  position: relative; overflow: hidden; border-radius: 6px;
+  background: var(--surface-3, rgba(255,255,255,.06));
+  color: transparent;
+}
+.song-row.skeleton .s-art.sk { width: 42px; height: 42px; border-radius: 8px; }
+.song-row.skeleton .s-title.sk { height: 12px; width: 55%; margin-bottom: 7px; }
+.song-row.skeleton .s-sub.sk { height: 10px; width: 35%; }
+.song-row.skeleton .s-dur.sk { display: inline-block; width: 32px; height: 10px; }
+.song-row.skeleton .sk::after {
+  content: ""; position: absolute; inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,.10), transparent);
+  animation: sk-shimmer 1.2s infinite;
+}
+@keyframes sk-shimmer { 100% { transform: translateX(100%); } }
+@media (prefers-reduced-motion: reduce) {
+  .song-row.skeleton .sk::after { animation: none; }
+}
+
+/* ---- Accessible focus states (keyboard navigation) ---- */
+.song-row:focus-visible,
+.icon-btn:focus-visible,
+.nav-item:focus-visible,
+.tab:focus-visible,
+.chip-btn:focus-visible,
+button:focus-visible,
+select:focus-visible,
+input:focus-visible,
+.song-scroll:focus-visible {
+  outline: 2px solid var(--green, #1ED760);
+  outline-offset: 2px;
+  border-radius: 6px;
+}

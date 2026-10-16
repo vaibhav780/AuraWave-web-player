@@ -94,9 +94,9 @@
 
     <div class="tabs" id="library-tabs" hidden></div>
 
-    <section class="song-scroll" id="song-scroll">
-      <div id="song-list" class="song-list"></div>
-      <div id="empty-state" class="empty-state" hidden></div>
+    <section class="song-scroll" id="song-scroll" aria-label="Song list" tabindex="0">
+      <div id="song-list" class="song-list" role="list"></div>
+      <div id="empty-state" class="empty-state" hidden role="status" aria-live="polite"></div>
     </section>
   </main>
 
@@ -114,23 +114,23 @@
           <div class="np-title" id="np-title">Nothing playing</div>
           <div class="np-sub" id="np-sub">Pick a track to start</div>
         </div>
-        <button class="icon-btn fav-btn" id="np-fav" title="Favorite">♡</button>
-        <button class="icon-btn" id="np-edit" title="Edit tags & cover art" hidden>✎</button>
+        <button class="icon-btn fav-btn" id="np-fav" title="Favorite" aria-label="Favorite current track">♡</button>
+        <button class="icon-btn" id="np-edit" title="Edit tags & cover art" aria-label="Edit tags and cover art" hidden>✎</button>
       </div>
 
-      <div class="np-controls">
-        <button class="icon-btn" id="btn-shuffle" title="Shuffle">🔀</button>
-        <button class="icon-btn" id="btn-prev" title="Previous">⏮</button>
-        <button class="icon-btn play" id="btn-play" title="Play/Pause">▶</button>
-        <button class="icon-btn" id="btn-next" title="Next">⏭</button>
-        <button class="icon-btn" id="btn-repeat" title="Repeat">🔁</button>
+      <div class="np-controls" role="group" aria-label="Playback controls">
+        <button class="icon-btn" id="btn-shuffle" title="Shuffle" aria-label="Shuffle">🔀</button>
+        <button class="icon-btn" id="btn-prev" title="Previous" aria-label="Previous track">⏮</button>
+        <button class="icon-btn play" id="btn-play" title="Play/Pause" aria-label="Play or pause">▶</button>
+        <button class="icon-btn" id="btn-next" title="Next" aria-label="Next track">⏭</button>
+        <button class="icon-btn" id="btn-repeat" title="Repeat" aria-label="Repeat mode">🔁</button>
       </div>
 
       <div class="np-extra">
-        <button class="icon-btn" id="btn-speed" title="Playback speed">1.0×</button>
-        <button class="icon-btn" id="btn-lyrics" title="Lyrics">🎙</button>
-        <button class="icon-btn" id="btn-eq" title="Equalizer & effects">🎛</button>
-        <button class="icon-btn" id="btn-queue" title="Queue">📑</button>
+        <button class="icon-btn" id="btn-speed" title="Playback speed" aria-label="Playback speed">1.0×</button>
+        <button class="icon-btn" id="btn-lyrics" title="Lyrics" aria-label="Lyrics">🎙</button>
+        <button class="icon-btn" id="btn-eq" title="Equalizer & effects" aria-label="Equalizer and effects">🎛</button>
+        <button class="icon-btn" id="btn-queue" title="Queue" aria-label="Queue">📑</button>
         <div class="vol-wrap">
           <span class="vol-ic" id="vol-ic">🔊</span>
           <input class="vol" id="vol" type="range" min="0" max="100" value="100">

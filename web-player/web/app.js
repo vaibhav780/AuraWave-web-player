@@ -1014,10 +1014,14 @@
   function songRow(song, index, contextList, displayNo = index + 1) {
     const row = el("div", "song-row");
     row.dataset.id = song.id;
-    if (currentSong() && currentSong().id === song.id) row.classList.add("playing");
+    // Accessibility: each row is a focusable control that plays the track.
+    row.setAttribute("role", "button");
+    row.setAttribute("tabindex", "0");
+    const sub = [song.artist, song.album].filter(Boolean).join(" • ");
+    row.setAttribute("aria-label", `Play ${song.title}${sub ? " by " + sub : ""}`);
+    if (currentSong() && currentSong().id === song.id) { row.classList.add("playing"); row.setAttribute("aria-current", "true"); }
     const fav = isFav(song.id);
     const lossless = /flac|wav/i.test(song.format || "") || /\.(flac|wav)$/i.test(song.url || "");
-    const sub = [song.artist, song.album].filter(Boolean).join(" • ");
     row.innerHTML = `
       <div class="s-index">${displayNo}</div>
       <div class="s-art"></div>
@@ -1031,11 +1035,11 @@
       <div class="s-right">
         <span class="s-dur">${fmtTime(song.duration || 0)}</span>
         <span class="s-actions">
-          <button class="icon-btn small lyr ${song.hasLyrics ? "on" : ""}" title="${song.hasLyrics ? "Lyrics available" : "No lyrics file"}">${ICONS.lyrics}</button>
-          <button class="icon-btn small fav ${fav ? "on" : ""}" title="Favorite">${fav ? ICONS.heartFilled : ICONS.heart}</button>
-          <button class="icon-btn small addq" title="Add to queue">${ICONS.addQueue}</button>
-          <button class="icon-btn small addpl" title="Add to playlist">${ICONS.plus}</button>
-          ${state.caps.canEditTags ? `<button class="icon-btn small edit" title="Edit tags & cover art">${ICONS.edit}</button>` : ""}
+          <button class="icon-btn small lyr ${song.hasLyrics ? "on" : ""}" title="${song.hasLyrics ? "Lyrics available" : "No lyrics file"}" aria-label="Show lyrics">${ICONS.lyrics}</button>
+          <button class="icon-btn small fav ${fav ? "on" : ""}" title="Favorite" aria-label="${fav ? "Remove from favorites" : "Add to favorites"}" aria-pressed="${fav}">${fav ? ICONS.heartFilled : ICONS.heart}</button>
+          <button class="icon-btn small addq" title="Add to queue" aria-label="Add to queue">${ICONS.addQueue}</button>
+          <button class="icon-btn small addpl" title="Add to playlist" aria-label="Add to playlist">${ICONS.plus}</button>
+          ${state.caps.canEditTags ? `<button class="icon-btn small edit" title="Edit tags & cover art" aria-label="Edit tags and cover art">${ICONS.edit}</button>` : ""}
         </span>
       </div>`;
     paintArt(row.querySelector(".s-art"), artUrlFor(song));
@@ -1043,6 +1047,11 @@
     row.addEventListener("click", (ev) => {
       if (ev.target.closest(".s-actions")) return;
       playFromContext(contextList, index);
+    });
+    // Keyboard: Enter / Space plays the focused row.
+    row.addEventListener("keydown", (ev) => {
+      if (ev.target !== row) return;
+      if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); playFromContext(contextList, index); }
     });
     row.querySelector(".lyr").addEventListener("click", (e) => { e.stopPropagation(); playFromContext(contextList, index); toggleLyrics(); });
     row.querySelector(".fav").addEventListener("click", (e) => { e.stopPropagation(); toggleFav(song); });
@@ -1106,6 +1115,9 @@
   // (streamUrlFor defined above)
 
   let crossfading = false;
+  // Per-track stream recovery: retry a failed load once (brief Wi-Fi drop) before
+  // giving up and auto-skipping to the next track.
+  let streamRecovery = { id: null, retried: false };
 
   /** The queue position that would play next (repeat-aware), or -1 if none. */
   function nextOrderPos() {
@@ -1142,6 +1154,7 @@
   function loadCurrent(autoplay) {
     const song = currentSong();
     if (!song) return;
+    if (!streamRecovery || streamRecovery.id !== song.id) streamRecovery = { id: song.id, retried: false };
     resetDecks();              // hard switch: cancel any in-flight crossfade
     const d = act();
     d.src = streamUrlFor(song);
@@ -1533,7 +1546,25 @@
   }
 
   // ----------------------------------------------------------------- loading songs
+  /** Paint lightweight skeleton rows so the list doesn't flash empty while loading. */
+  function showLoadingSkeleton() {
+    if (state.songs.length) return;   // we already have content to show
+    songList.className = "song-list";
+    emptyState.hidden = true;
+    songList.innerHTML = "";
+    for (let i = 0; i < 8; i++) {
+      const row = el("div", "song-row skeleton");
+      row.setAttribute("aria-hidden", "true");
+      row.innerHTML =
+        '<div class="s-index">&nbsp;</div><div class="s-art sk"></div>' +
+        '<div class="s-main"><div class="s-title sk"></div><div class="s-sub sk"></div></div>' +
+        '<div class="s-right"><span class="s-dur sk">&nbsp;</span></div>';
+      songList.appendChild(row);
+    }
+  }
+
   async function loadSongs(baseUrl) {
+    showLoadingSkeleton();
     try {
       const url = baseUrl ? baseUrl.replace(/\/+$/, "") + "/songs.json" : "/songs.json";
       const res = await fetch(url, { cache: "no-store" });
@@ -1559,6 +1590,7 @@
       state.songs = data;
       updateCounts();
       render();
+      restoreScroll();         // jump back to where you were on reload
       toast(`Loaded ${data.length} track${data.length === 1 ? "" : "s"}`);
     } catch (err) {
       toast("Could not load songs: " + err.message);
@@ -1568,7 +1600,23 @@
   }
 
   // ----------------------------------------------------------------- views / nav
+  /** Persist/restore the scroll position of the song area, per view, across reloads. */
+  function saveScroll() {
+    const sc = $("#song-scroll");
+    if (!sc) return;
+    const m = ls.get("scrollPos", {}) || {};
+    m[state.view] = sc.scrollTop;
+    ls.set("scrollPos", m);
+  }
+  function restoreScroll() {
+    const sc = $("#song-scroll");
+    if (!sc) return;
+    const y = (ls.get("scrollPos", {}) || {})[state.view] || 0;
+    requestAnimationFrame(() => { sc.scrollTop = y; });
+  }
+
   function setView(view) {
+    saveScroll();              // remember where we were in the outgoing view
     state.view = view;
     $$(".nav-item").forEach((b) => b.classList.remove("active"));
     if (view.startsWith("playlist:")) renderPlaylists();
@@ -1593,8 +1641,12 @@
     const listView = ["library", "songs", "favorites", "recent"].includes(view) || view.startsWith("playlist:");
     $(".toolbar-controls").style.display = listView ? "" : "none";
 
+    // Remember the active view so a reload lands you back where you were.
+    ls.set("lastView", view);
+
     document.body.classList.remove("nav-open");
     render();
+    restoreScroll();           // return to the remembered position for this view
   }
 
   // ----------------------------------------------------------------- equalizer panel UI
@@ -1988,6 +2040,16 @@
 
     // nav
     $$(".nav-item[data-view]").forEach((b) => b.addEventListener("click", () => setView(b.dataset.view)));
+
+    // Remember scroll position per view (throttled) so reloads/nav restore it.
+    const songScroll = $("#song-scroll");
+    if (songScroll) {
+      let scrollSaveT = null;
+      songScroll.addEventListener("scroll", () => {
+        clearTimeout(scrollSaveT);
+        scrollSaveT = setTimeout(saveScroll, 200);
+      });
+    }
     $("#btn-new-playlist").addEventListener("click", () => promptText("New playlist", "Playlist name:", "My Playlist", (n) => createPlaylist(n)));
     $("#btn-import-playlists").addEventListener("click", importDiskPlaylists);
 
@@ -1997,15 +2059,20 @@
     $("#tag-scrim").addEventListener("click", (e) => { if (e.target === $("#tag-scrim")) closeTagEditor(); });
     $("#np-edit").addEventListener("click", (e) => { e.stopPropagation(); const s = currentSong(); if (s) openTagEditor(s); });
 
-    // search
+    // search — debounced so typing in a large library stays smooth (one render
+    // after the user pauses, not one per keystroke).
     const search = $("#search");
+    let searchTimer = null;
     search.addEventListener("input", () => {
-      state.search = search.value;
       $("#btn-clear-search").hidden = !search.value;
-      render();
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(() => { state.search = search.value; render(); }, 150);
     });
     search.addEventListener("change", () => addSearchHistory(search.value));
-    $("#btn-clear-search").addEventListener("click", () => { search.value = ""; state.search = ""; $("#btn-clear-search").hidden = true; render(); });
+    $("#btn-clear-search").addEventListener("click", () => {
+      clearTimeout(searchTimer);
+      search.value = ""; state.search = ""; $("#btn-clear-search").hidden = true; render();
+    });
 
     // server connect
     $("#btn-connect").addEventListener("click", () => {
@@ -2144,7 +2211,29 @@
       d.addEventListener("ended", () => { if (d === act() && !crossfading) next(true); });
       d.addEventListener("play", () => { if (d !== act()) return; setIcon($("#btn-play"), "pause"); if (ac && ac.state === "suspended") ac.resume(); if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "playing"; });
       d.addEventListener("pause", () => { if (d !== act() || crossfading) return; setIcon($("#btn-play"), "play"); savePlaybackState(true); if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "paused"; });
-      d.addEventListener("error", () => { if (d === act() && currentSong()) toast("Playback error — skipping"); });
+      d.addEventListener("error", () => {
+        const s = currentSong();
+        if (d !== act() || crossfading || !s) return;
+        // Retry the same track once (transient network blip), then auto-skip.
+        if (streamRecovery.id === s.id && !streamRecovery.retried) {
+          streamRecovery.retried = true;
+          toast("Playback hiccup — retrying…");
+          setTimeout(() => {
+            if (currentSong() && currentSong().id === s.id) {
+              d.src = streamUrlFor(s); d.load(); play();
+            }
+          }, 800);
+          return;
+        }
+        // Already retried: skip forward (but don't loop forever on an all-bad queue).
+        if (state.order.length > 1) {
+          toast("Skipping unplayable track");
+          next(true);
+        } else {
+          toast("Playback error");
+          pause();
+        }
+      });
     });
     window.addEventListener("beforeunload", () => savePlaybackState(true));
 
@@ -2242,7 +2331,10 @@
     setIcon($("#vol-ic"), state.eq.volume === 0 ? "mute" : "volume");
     fillRange($("#vol")); fillRange($("#seek"));
     applyEffects();          // sets volume/speed on the element even before graph exists
-    setView("library");
+    // Restore the last view (skip detail pages that need a loaded library).
+    const savedView = ls.get("lastView", "library");
+    const topViews = ["library", "songs", "favorites", "recent", "albums", "artists", "years", "stats"];
+    setView(topViews.includes(savedView) || savedView.startsWith("playlist:") ? savedView : "library");
     restorePlayback();       // restore the last queue + position (paused)
     loadSongs(savedUrl || "");   // load from this server by default
     fetchCapabilities();     // discover optional server features (tag editing, etc.)

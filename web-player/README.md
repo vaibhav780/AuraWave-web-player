@@ -101,6 +101,15 @@ Optional dependencies live in **`requirements-optional.txt`**
 (`pip install -r requirements-optional.txt` for `mutagen` + `watchdog`). SQLite
 and scrobbling need nothing beyond the standard library.
 
+### Performance & reliability polish
+
+- **Debounced search** — typing filters once you pause, not on every keystroke (smooth on large libraries).
+- **Signature-gated indexing** — the FTS index is only rebuilt when the catalog actually changes (the watcher drives refreshes; the scan TTL is now a long safety net).
+- **Resilient playback** — a failed track is retried once (brief Wi-Fi blip) and then **auto-skipped** instead of stalling.
+- **Loading skeletons** — the song list shows shimmer placeholders while the catalog loads.
+- **Accessibility** — keyboard-navigable rows (Enter/Space to play), ARIA labels on controls, visible focus outlines, reduced-motion support.
+- **Remembers where you were** — the last view and per-view scroll position are restored across reloads.
+
 ## Use the SAME server your Android app connects to (recommended)
 
 You don't have to run this standalone server at all. The two streaming servers

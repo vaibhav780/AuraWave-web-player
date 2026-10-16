@@ -925,8 +925,22 @@ def scan_music(music_dir: str):
 # --- Catalog cache (simple library "index") --------------------------------
 # Re-scanning and re-reading tags on every request is slow for big libraries, so
 # we cache the scan and reuse it until the folder changes or the TTL expires.
-_CATALOG_TTL = 30
-_catalog_cache = {"folder": None, "at": 0.0, "mtime": None, "tracks": None}
+# The live folder watcher now drives rebuilds, so the TTL is just a long safety
+# net rather than the primary refresh mechanism.
+_CATALOG_TTL = 3600
+_catalog_cache = {"folder": None, "at": 0.0, "mtime": None, "tracks": None, "sig": None}
+
+
+def _catalog_signature(tracks):
+    """A cheap fingerprint of the catalog so we only re-index the FTS table when
+    the library's contents actually changed (not on every periodic re-scan)."""
+    return hashlib.sha1(
+        "\n".join(
+            f"{t.get('id')}|{t.get('title')}|{t.get('artist')}|{t.get('album')}|"
+            f"{t.get('albumArtist')}|{t.get('genre')}|{t.get('musicDirector')}"
+            for t in tracks
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def get_catalog(force: bool = False):
@@ -940,8 +954,11 @@ def get_catalog(force: bool = False):
             and c["mtime"] == mtime and (now - c["at"]) < _CATALOG_TTL):
         return c["tracks"]
     tracks = scan_music(MUSIC_DIR)
-    c.update(folder=MUSIC_DIR, at=now, mtime=mtime, tracks=tracks)
-    index_tracks(tracks)
+    sig = _catalog_signature(tracks)
+    # Only rebuild the (potentially large) FTS index when the catalog changed.
+    if sig != c.get("sig"):
+        index_tracks(tracks)
+    c.update(folder=MUSIC_DIR, at=now, mtime=mtime, tracks=tracks, sig=sig)
     return tracks
 
 

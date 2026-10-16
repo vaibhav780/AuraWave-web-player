@@ -1,0 +1,28 @@
+# Normalize line endings across platforms.
+# Text files are stored with LF in the repo; Git converts on checkout as needed.
+* text=auto eol=lf
+
+# Windows batch scripts must keep CRLF to run correctly.
+*.bat text eol=crlf
+
+# Shell scripts must keep LF.
+*.sh  text eol=lf
+
+# Source / docs: force LF.
+*.py   text eol=lf
+*.js   text eol=lf
+*.css  text eol=lf
+*.html text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf
+*.json text eol=lf
+
+# Binary files — never touch line endings.
+*.zip  binary
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.db   binary
+*.apk  binary
