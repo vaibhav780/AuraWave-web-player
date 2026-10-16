@@ -569,16 +569,57 @@ PLAYLIST_EXTS = (".m3u", ".m3u8", ".pls")
 
 
 def _resolve_rel(rel: str):
-    """Resolve a bare (non-url-encoded) relative posix path inside MUSIC_DIR."""
-    decoded = (rel or "").lstrip("/").replace("/", os.sep)
-    if not decoded:
+    """Resolve a track's relative path to a real file inside MUSIC_DIR.
+
+    Tolerant of the different shapes clients may send: a bare posix path, a
+    url-encoded path (the track id), or one carrying a leading ``stream/``
+    segment. Falls back to a unique basename match so a tag edit still lands on
+    the right file even if the path shape doesn't match exactly. Traversal-safe.
+    """
+    if not rel:
         return None
-    candidate = os.path.normpath(os.path.join(MUSIC_DIR, decoded))
     root = os.path.abspath(MUSIC_DIR)
-    cand = os.path.abspath(candidate)
-    if cand != root and not cand.startswith(root + os.sep):
-        return None
-    return cand if os.path.isfile(cand) else None
+
+    # Candidate relative strings to try, most-specific first.
+    raw = rel.strip()
+    candidates = [raw]
+    try:
+        dec = urllib.parse.unquote(raw)
+        if dec != raw:
+            candidates.append(dec)
+    except Exception:
+        dec = raw
+    # Strip a leading "/stream/" or "stream/" segment if present.
+    for c in list(candidates):
+        c2 = re.sub(r"^/?stream/", "", c)
+        if c2 != c:
+            candidates.append(c2)
+
+    for cand_rel in candidates:
+        decoded = cand_rel.lstrip("/").replace("/", os.sep)
+        if not decoded:
+            continue
+        cand = os.path.abspath(os.path.normpath(os.path.join(MUSIC_DIR, decoded)))
+        if (cand == root or cand.startswith(root + os.sep)) and os.path.isfile(cand):
+            return cand
+
+    # Last resort: match by (unique) basename anywhere in the tree.
+    want = os.path.basename(
+        (urllib.parse.unquote(raw) if "%" in raw else raw).replace("\\", "/")
+    ).lower()
+    if want:
+        matches = []
+        for r, dirs, files in os.walk(MUSIC_DIR, onerror=lambda e: None):
+            for name in files:
+                if name.lower() == want:
+                    matches.append(os.path.join(r, name))
+                    if len(matches) > 1:
+                        break
+            if len(matches) > 1:
+                break
+        if len(matches) == 1:
+            return os.path.abspath(matches[0])
+    return None
 
 
 def _invalidate_track_cache(rel_posix: str):

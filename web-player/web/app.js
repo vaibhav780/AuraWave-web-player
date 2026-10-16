@@ -1811,6 +1811,8 @@
     tagEditSong = song;
     TAG_FIELDS.forEach((k) => { $("#tag-" + k).value = song[k] != null ? song[k] : ""; });
     $("#tag-art").value = "";
+    // Save stays disabled until the user actually changes something.
+    $("#tag-save").disabled = true;
     $("#tag-scrim").hidden = false;
     setTimeout(() => $("#tag-title").focus(), 30);
   }
@@ -1840,9 +1842,10 @@
   async function saveTagEditor() {
     const song = tagEditSong;
     if (!song) return;
+    const relPath = relPathOf(song) || song.path || "";
     const fields = {};
     TAG_FIELDS.forEach((k) => { fields[k] = $("#tag-" + k).value; });
-    const payload = { path: song.path || "", ...fields };
+    const payload = { path: relPath, ...fields };
     const file = $("#tag-art").files && $("#tag-art").files[0];
     $("#tag-save").disabled = true;
     try {
@@ -1856,7 +1859,7 @@
       // 2) Optionally embed cover art (failure here does NOT undo the tag save).
       if (file) {
         try {
-          const ar = await fetch("/edit-art?path=" + encodeURIComponent(song.path || ""), {
+          const ar = await fetch("/edit-art?path=" + encodeURIComponent(relPath), {
             method: "POST", headers: { "Content-Type": file.type || "image/jpeg" }, body: file,
           });
           if (!ar.ok) toast("Tags saved, but cover art upload failed");
@@ -1960,7 +1963,9 @@
   function relPathOf(song) {
     if (!song) return null;
     if (song.path) return song.path;
-    if (song.streamPath) { try { return decodeURIComponent(song.streamPath.replace(/^\/stream\//, "")); } catch { return null; } }
+    if (song.streamPath) { try { return decodeURIComponent(song.streamPath.replace(/^\/stream\//, "")); } catch {} }
+    // Fall back to the track id (which servers derive from the url-encoded rel path).
+    if (song.id) { try { return decodeURIComponent(song.id); } catch { return song.id; } }
     return null;
   }
   async function fetchLyrics(force) {
@@ -2090,6 +2095,13 @@
     // tag & cover-art editor
     $("#tag-cancel").addEventListener("click", closeTagEditor);
     $("#tag-save").addEventListener("click", saveTagEditor);
+    // Enable Save as soon as any field (or the cover-art picker) changes.
+    const enableSave = () => { $("#tag-save").disabled = false; };
+    TAG_FIELDS.forEach((k) => {
+      const inp = $("#tag-" + k);
+      if (inp) inp.addEventListener("input", enableSave);
+    });
+    $("#tag-art").addEventListener("change", enableSave);
     $("#tag-scrim").addEventListener("click", (e) => { if (e.target === $("#tag-scrim")) closeTagEditor(); });
     $("#np-edit").addEventListener("click", (e) => { e.stopPropagation(); const s = currentSong(); if (s) openTagEditor(s); });
 
