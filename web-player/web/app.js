@@ -1815,19 +1815,45 @@
     setTimeout(() => $("#tag-title").focus(), 30);
   }
   function closeTagEditor() { $("#tag-scrim").hidden = true; tagEditSong = null; }
+  /** Apply edited fields to every in-memory copy of a track (library, queue,
+   *  favorites, recents, playlists) so edits show instantly everywhere — the
+   *  cover-art upload is optional and never required for tag changes to stick. */
+  function applyTagsLocally(id, fields) {
+    const patch = (s) => {
+      if (!s || s.id !== id) return;
+      TAG_FIELDS.forEach((k) => {
+        const v = fields[k];
+        if (v === "" || v == null) { if (k !== "title") s[k] = (k === "year" ? null : ""); return; }
+        s[k] = (k === "year") ? (parseInt(v, 10) || null) : v;
+      });
+    };
+    state.songs.forEach(patch);
+    state.queue.forEach(patch);
+    state.favorites.forEach(patch);
+    state.recent.forEach(patch);
+    state.playlists.forEach((pl) => pl.songs.forEach(patch));
+    ls.set("favorites", state.favorites);
+    ls.set("recent", state.recent);
+    ls.set("playlists", state.playlists);
+  }
+
   async function saveTagEditor() {
     const song = tagEditSong;
     if (!song) return;
-    const payload = { path: song.path || "" };
-    TAG_FIELDS.forEach((k) => { payload[k] = $("#tag-" + k).value; });
+    const fields = {};
+    TAG_FIELDS.forEach((k) => { fields[k] = $("#tag-" + k).value; });
+    const payload = { path: song.path || "", ...fields };
     const file = $("#tag-art").files && $("#tag-art").files[0];
     $("#tag-save").disabled = true;
     try {
+      // 1) Save the tag fields (always — independent of any cover art).
       const r = await fetch("/edit-tags", {
         method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
       });
       const d = await r.json().catch(() => null);
-      if (!r.ok || !d || !d.ok) { toast((d && d.error) || "Could not save tags"); $("#tag-save").disabled = false; return; }
+      if (!r.ok || !d || !d.ok) { toast((d && d.error) || "Could not save tags"); return; }
+
+      // 2) Optionally embed cover art (failure here does NOT undo the tag save).
       if (file) {
         try {
           const ar = await fetch("/edit-art?path=" + encodeURIComponent(song.path || ""), {
@@ -1836,8 +1862,16 @@
           if (!ar.ok) toast("Tags saved, but cover art upload failed");
         } catch { toast("Tags saved, but cover art upload failed"); }
       }
+
+      // 3) Reflect the change immediately across the whole UI, then reconcile
+      //    with a fresh catalog from the server.
+      applyTagsLocally(song.id, fields);
       closeTagEditor();
-      toast("Saved — refreshing library");
+      render();
+      renderQueue();
+      updateNowPlaying();
+      updateMediaSession();
+      toast("Saved ✓");
       loadSongs(ls.get("serverUrl", "") || "");
     } catch {
       toast("Could not save tags");
