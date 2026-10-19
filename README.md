@@ -36,7 +36,8 @@ long as it's on the same Wi-Fi. Lossless **FLAC/WAV** files seek instantly thank
 HTTP range streaming, and a rich **Web Audio** effects engine (equalizer, crossfeed,
 reverb and more) runs entirely in the browser.
 
-This repository ships **two complementary servers**:
+This bundle ships **three servers plus the Android app** — everything you need to
+run AuraWave on a fresh machine:
 
 <table>
 <tr>
@@ -60,10 +61,32 @@ player UI at `/player/`.
 
 </td>
 </tr>
+<tr>
+<td width="50%" valign="top">
+
+### 📲 `update-server/`
+An **OTA app-update server** (standard library only) that pushes the bundled
+**Android APK** to phones over Wi-Fi via a QR code — no app store, no cable.
+The latest `app-debug.apk` is included here.
+
+**Default port:** `9696`
+
+</td>
+<td width="50%" valign="top">
+
+### 📱 Android app
+The native **AuraWave** Android client (`update-server/app-debug.apk`). Install it
+by scanning the update server's "FIRST INSTALL" QR, then stream from either server.
+
+**Package:** `com.aurawave.localmusicplayer`
+
+</td>
+</tr>
 </table>
 
-> They can run side by side (different ports), and the desktop server reuses the web
-> player's UI from the sibling `web-player/web` folder.
+> The streaming servers run side by side (different ports), and the desktop server
+> reuses the web player's UI from the sibling `web-player/web` folder. The update
+> server is independent — run it whenever you need to install/update the phone app.
 
 ---
 
@@ -81,7 +104,7 @@ player UI at `/player/`.
 - 🎧 **Headphone crossfeed** (BS2B-style) for natural headphone listening
 - 🌈 Reverb (Room / Hall / Stadium), **stereo-widen**, **X-Bass**, **X-Surround**
 - ⏩ Playback speed **0.5×–2.0×** (pitch-preserving) + loudness **normalization**
-- 📊 A **4-style audio visualizer** (Bars / Mirror / Rainbow / Wave)
+- 📊 A **6-style audio visualizer** (Bars / Mirror / Rainbow / Wave / Ring / Particles)
 
 ### 🗂️ Library Management & Data *(web-player server)*
 - 👀 **Live folder watcher** — auto re-index on add/remove/change (`watchdog`, or a stdlib polling fallback)
@@ -156,7 +179,24 @@ python app.py                   # http://localhost:8080  (browser player at /pla
 </details>
 
 <details>
-<summary><b>📱 Open it on your phone</b></summary>
+<summary><b>📲 Install the Android app (OTA update server)</b></summary>
+
+```bash
+cd update-server
+python update_server.py          # http://localhost:9696  (serves the bundled APK)
+```
+
+1. Make sure your phone and PC are on the **same Wi-Fi**.
+2. Open `http://<your-lan-ip>:9696/qr` on the PC and **scan the "FIRST INSTALL" QR**
+   with your phone's camera (or browse to `http://<your-lan-ip>:9696/update.apk`).
+3. Tap the downloaded `app-debug.apk` to install (allow "Install unknown apps" when
+   prompted). Later, use the app's **"Check for App Update"** button to pull a newer
+   APK dropped into this folder.
+
+</details>
+
+<details>
+<summary><b>📱 Open the web player on your phone</b></summary>
 
 1. Make sure your phone and PC are on the **same Wi-Fi**.
 2. On the PC, open `http://<your-lan-ip>:<port>/qr`.
@@ -221,10 +261,16 @@ AuraWave/
 │     ├─ app.js                ← all player logic (library, queue, effects…)
 │     └─ styles.css            ← emerald/teal theme
 │
-└─ desktop-server/             🖥️ GUI streaming server (port 8080)
-   ├─ app.py
-   ├─ requirements.txt
-   └─ run.bat
+├─ desktop-server/             🖥️ GUI streaming server (port 8080)
+│  ├─ app.py
+│  ├─ requirements.txt
+│  └─ run.bat
+│
+└─ update-server/              📲 OTA app-update server (port 9696)
+   ├─ update_server.py         ← serves update.json + the APK + QR
+   ├─ app-debug.apk            ← the bundled Android app (install this on your phone)
+   ├─ app-version.json
+   └─ run_update_server.bat
 ```
 
 Each subfolder has its own README with deeper details.
@@ -290,7 +336,7 @@ Only run it on networks you trust.
 
 ---
 
-## 🤝 Contributing vaibhav M
+## 🤝 Contributing
 
 Issues and pull requests are welcome! Fork the repo, create a feature branch, and
 open a PR with a clear description.

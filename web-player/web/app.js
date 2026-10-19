@@ -30,11 +30,11 @@
    *  or null when there's no usable album. The server downloads + caches it. */
   function artUrlFor(song) {
     if (song.artworkUrl && /^(https?:)?\/\//.test(song.artworkUrl)) return song.artworkUrl;
-    if (song.artworkUrl && song.artworkUrl.startsWith("/")) return song.artworkUrl;
+    if (song.artworkUrl && song.artworkUrl.startsWith("/")) return apiBase() + song.artworkUrl;
     const album = (song.album || "").trim();
     if (!album || /^unknown/i.test(album)) return null;
     const artist = (song.albumArtist || song.artist || "").trim();
-    return "/art?" + new URLSearchParams({ album, artist }).toString();
+    return apiBase() + "/art?" + new URLSearchParams({ album, artist }).toString();
   }
   /** Fill an .s-art / .np-art box with an <img>, falling back to 🎵 on error. */
   function paintArt(box, url) {
@@ -85,6 +85,26 @@
     },
     set(key, val) { try { localStorage.setItem("aura." + key, JSON.stringify(val)); } catch {} },
   };
+
+  // All server APIs must target the server the CATALOG came from — which may be a
+  // remote server entered in the Connect box, not the origin that served this page.
+  // Otherwise edits/scrobbles/lyrics hit the wrong server (e.g. "file not found").
+  const apiBase = () => (ls.get("serverUrl", "") || "").replace(/\/+$/, "");
+  const api = (path) => apiBase() + path;
+  /** Fetch an API path from the catalog's server, falling back to same-origin when
+   *  the configured server is unreachable or lacks the endpoint (404). This keeps
+   *  editing/scrobbling/lyrics working whether the page is served by that server
+   *  directly or a stale/remote Connect URL is configured. */
+  async function apiFetch(path, opts) {
+    const base = apiBase();
+    if (base) {
+      try {
+        const r = await fetch(base + path, opts);
+        if (r.status !== 404) return r;   // a real answer (ok OR a 4xx/5xx) from that server
+      } catch { /* unreachable -> try same-origin */ }
+    }
+    return fetch(path, opts);             // same-origin fallback
+  }
 
   // ----------------------------------------------------------------- enums
   const SORTS = [
@@ -145,7 +165,7 @@
     recent: ls.get("recent", []),
     playlists: ls.get("playlists", []),
     searchHistory: ls.get("searchHistory", []),
-    caps: { canEditTags: false, fts: false, watch: false }, // filled from GET /capabilities
+    caps: { canEditTags: false, fts: false, watch: false, aiInstrumental: false, stemMixer: false }, // filled from GET /capabilities
     eq: ls.get("eq", {
       enabled: true,
       preset: "Flat",
@@ -160,6 +180,11 @@
       crossfade: 0,      // seconds; 0 = gapless hand-off
       normalize: false,  // loudness leveling
       crossfeed: 0,      // headphone crossfeed (BS2B-style), 0..100
+      vocalRemove: false, // master: remove vocals / play instrumental only
+      vocalStrength: 100, // client mode: how strongly to cancel the centre, 0..100
+      vocalMode: "client", // where separation runs: "client" (real-time) | "server" (AI Demucs)
+      limiter: true,     // safety limiter so EQ/bass boosts never clip
+      surround3d: 0,     // 3D virtual surround (HRTF) amount, 0..100
       eqMode: "graphic", // "graphic" (10-band presets) | "parametric"
       eqParam: null,     // parametric bands: [{type,freq,gain,q}] (lazily defaulted)
     }),
@@ -168,6 +193,17 @@
   if (state.eq.crossfade == null) state.eq.crossfade = 0;
   if (state.eq.normalize == null) state.eq.normalize = false;
   if (state.eq.crossfeed == null) state.eq.crossfeed = 0;
+  if (state.eq.vocalRemove == null) state.eq.vocalRemove = false;
+  if (state.eq.vocalStrength == null) state.eq.vocalStrength = 100;
+  // Migrate the earlier separate "aiInstrumental" flag into the mode selector.
+  if (state.eq.vocalMode == null) state.eq.vocalMode = state.eq.aiInstrumental ? "server" : "client";
+  delete state.eq.aiInstrumental;
+  if (state.eq.limiter == null) state.eq.limiter = true;
+  if (state.eq.surround3d == null) state.eq.surround3d = 0;
+  // Stem-mixer settings (separate ls key; its own enable + per-stem volumes).
+  state.stems = ls.get("stems", { on: false, v: 0, d: 100, b: 100, o: 100 });
+  // User-saved custom EQ presets: [{name, gains:[10]}].
+  state.userPresets = ls.get("userPresets", []);
   if (state.eq.eqMode == null) state.eq.eqMode = "graphic";
   // Default parametric bands mirror the graphic EQ centre frequencies; the first
   // band is a low-shelf, the last a high-shelf, the rest peaking filters.
@@ -198,6 +234,16 @@
   let fadeGains = [], chainIn = null;        // per-deck crossfade gains + shared EQ input
   let normComp = null, normMakeup = null;    // loudness normalization (compressor + makeup)
   let cfDirect = null, cfCrossL = null, cfCrossR = null; // headphone crossfeed gains
+  let vrRtoL = null, vrLtoR = null;          // vocal-removal centre-cancel cross gains
+  let brickLimiter = null;                   // safety limiter on the final stage
+  let hrtfWet = null;                        // 3D virtual-surround (HRTF) wet mix
+  let bypassAll = false;                     // A/B compare: bypass all tonal/spatial effects
+
+  /** Position a PannerNode, tolerating old (setPosition) and new (AudioParam) APIs. */
+  function setPannerPos(p, x, y, z) {
+    try { p.positionX.value = x; p.positionY.value = y; p.positionZ.value = z; }
+    catch { try { p.setPosition(x, y, z); } catch {} }
+  }
 
   /** Build the Web Audio graph once (on first play, after a user gesture).
    *  Everything is built into locals and only committed to the module-level
@@ -234,8 +280,25 @@
       const bass = ctx.createBiquadFilter();
       bass.type = "lowshelf"; bass.frequency.value = 110; bass.gain.value = 0;
 
-      // Chain input (both decks) -> eq... -> xbass
-      let prev = cin;
+      // --- Vocal removal (centre-channel cancellation) -------------------
+      // Classic "karaoke" matrix: outL = L - s·R, outR = R - s·L. Content panned
+      // dead-centre (usually the lead vocal) is equal in both channels, so the
+      // cross-subtraction cancels it; hard-panned instruments survive. `s` (the
+      // cross gain) is driven from applyEffects(): 0 = untouched stereo.
+      const vrSplit = ctx.createChannelSplitter(2);
+      const vrMerge = ctx.createChannelMerger(2);
+      const vLL = ctx.createGain(); vLL.gain.value = 1;  // L -> outL
+      const vRL = ctx.createGain(); vRL.gain.value = 0;  // R -> outL (-s)
+      const vLR = ctx.createGain(); vLR.gain.value = 0;  // L -> outR (-s)
+      const vRR = ctx.createGain(); vRR.gain.value = 1;  // R -> outR
+      cin.connect(vrSplit);
+      vrSplit.connect(vLL, 0); vrSplit.connect(vLR, 0); // L
+      vrSplit.connect(vRL, 1); vrSplit.connect(vRR, 1); // R
+      vLL.connect(vrMerge, 0, 0); vRL.connect(vrMerge, 0, 0); // -> left
+      vLR.connect(vrMerge, 0, 1); vRR.connect(vrMerge, 0, 1); // -> right
+
+      // Chain input (both decks) -> vocal-removal matrix -> eq... -> xbass
+      let prev = vrMerge;
       for (const n of eq) { prev.connect(n); prev = n; }
       prev.connect(bass);
 
@@ -305,11 +368,29 @@
       cfXR.connect(cfMerge, 0, 0);  // right source -> left channel
       cfMerge.connect(cfOut);
 
+      // --- 3D virtual surround (HRTF) ------------------------------------
+      // Externalise the sound on headphones by placing two virtual front
+      // speakers (±) around the listener via HRTF panners. Wet level is driven
+      // from applyEffects(); 0 = bypassed. Summed into the crossfeed output bus.
+      const h3Split = ctx.createChannelSplitter(2);
+      const pannerL = ctx.createPanner(); pannerL.panningModel = "HRTF";
+      const pannerR = ctx.createPanner(); pannerR.panningModel = "HRTF";
+      setPannerPos(pannerL, -0.6, 0, -0.5);
+      setPannerPos(pannerR, 0.6, 0, -0.5);
+      const hWet = ctx.createGain(); hWet.gain.value = 0;
+      master.connect(h3Split);
+      h3Split.connect(pannerL, 0);
+      h3Split.connect(pannerR, 1);
+      pannerL.connect(hWet); pannerR.connect(hWet);
+      hWet.connect(cfOut);
+
       // Loudness normalization: a compressor + makeup gain that evens out levels
       // between tracks. Transparent (ratio 1) when disabled.
       const comp = ctx.createDynamicsCompressor();
       const makeup = ctx.createGain(); makeup.gain.value = 1;
-      cfOut.connect(comp).connect(makeup).connect(ctx.destination);
+      // Safety limiter: catches peaks from EQ/bass boosts so nothing clips.
+      const limiter = ctx.createDynamicsCompressor();
+      cfOut.connect(comp).connect(makeup).connect(limiter).connect(ctx.destination);
 
       // Analyser tap for the visualizer (reads the post-effects signal).
       const an = ctx.createAnalyser();
@@ -323,6 +404,9 @@
       dryGain = dry; reverbConv = conv; reverbWet = rWet;
       surroundWet = sWet; widenWet = wWet;
       cfDirect = cfDir; cfCrossL = cfXL; cfCrossR = cfXR;
+      vrRtoL = vRL; vrLtoR = vLR;
+      hrtfWet = hWet;
+      brickLimiter = limiter;
       fadeGains = [fadeA, fadeB]; chainIn = cin;
       normComp = comp; normMakeup = makeup;
       analyser = an; vizFreq = new Uint8Array(an.frequencyBinCount); vizTime = new Uint8Array(an.fftSize);
@@ -373,6 +457,9 @@
 
     if (!ac) return;
 
+    // A/B compare: neutralise every tonal/spatial effect (keep volume + speed).
+    if (bypassAll) { neutralizeEffects(); return; }
+
     // EQ bands. In graphic mode the 10 biquads are peaking filters driven by the
     // genre-preset gains; in parametric mode each band's type/freq/Q/gain comes
     // from e.eqParam (band 0 = low-shelf, last = high-shelf, rest = peaking).
@@ -398,6 +485,16 @@
       const cf = (e.crossfeed || 0) / 100 * 0.5;
       cfCrossL.gain.value = cf;
       cfCrossR.gain.value = cf;
+    }
+
+    // Vocal removal (client mode only): cross-subtract the opposite channel to
+    // cancel centre-panned vocals. Strength 0..100 -> cross gain 0..1. In server
+    // (AI) mode this stays off because the deck already plays a vocal-free mix.
+    if (vrRtoL && vrLtoR) {
+      const clientVocal = e.vocalRemove && e.vocalMode === "client";
+      const s = clientVocal ? (e.vocalStrength ?? 100) / 100 : 0;
+      vrRtoL.gain.value = -s;
+      vrLtoR.gain.value = -s;
     }
 
     // X-Bass: 0..100 -> 0..12 dB low-shelf.
@@ -441,6 +538,20 @@
       }
     }
 
+    // 3D virtual surround (HRTF): 0..100 -> 0..~1.2 wet level.
+    if (hrtfWet) hrtfWet.gain.value = (e.surround3d || 0) / 100 * 1.2;
+
+    // Safety limiter: a fast, hard-ish compressor near 0 dBFS when enabled.
+    if (brickLimiter) {
+      if (e.limiter) {
+        brickLimiter.threshold.value = -1.0; brickLimiter.knee.value = 0;
+        brickLimiter.ratio.value = 20; brickLimiter.attack.value = 0.002; brickLimiter.release.value = 0.08;
+      } else {
+        brickLimiter.threshold.value = 0; brickLimiter.knee.value = 0;
+        brickLimiter.ratio.value = 1; brickLimiter.attack.value = 0.003; brickLimiter.release.value = 0.08;
+      }
+    }
+
     // Keep the active-deck fade gain authoritative when not mid-crossfade.
     if (fadeGains.length && !crossfading) {
       fadeGains[deckIndex].gain.value = 1;
@@ -448,14 +559,35 @@
     }
   }
 
+  /** A/B bypass: set every tonal/spatial node to transparent without touching
+   *  state.eq (so flipping bypass off restores the user's settings exactly). */
+  function neutralizeEffects() {
+    eqNodes.forEach((n) => { n.gain.value = 0; });
+    if (xbass) xbass.gain.value = 0;
+    if (widenGLL) { widenGLL.gain.value = 1; widenGRL.gain.value = 0; widenGLR.gain.value = 0; widenGRR.gain.value = 1; }
+    if (widenWet) widenWet.gain.value = 0;
+    if (reverbWet) reverbWet.gain.value = 0;
+    if (dryGain) dryGain.gain.value = 1;
+    if (surroundWet) surroundWet.gain.value = 0;
+    if (cfCrossL) { cfCrossL.gain.value = 0; cfCrossR.gain.value = 0; }
+    if (vrRtoL) { vrRtoL.gain.value = 0; vrLtoR.gain.value = 0; }
+    if (hrtfWet) hrtfWet.gain.value = 0;
+    if (normComp) { normComp.threshold.value = 0; normComp.ratio.value = 1; normComp.knee.value = 0; }
+    if (normMakeup) normMakeup.gain.value = 1;
+    if (brickLimiter) { brickLimiter.threshold.value = 0; brickLimiter.ratio.value = 1; brickLimiter.knee.value = 0; }
+  }
+
   // ----------------------------------------------------------------- visualizer
   let vizCanvas = null, vizCtx = null, vizRAF = 0, vizW = 0, vizH = 0;
   const VIZ_BARS = 56;
   const vizSmooth = new Array(VIZ_BARS).fill(0);
-  const VIZ_STYLES = ["bars", "mirror", "rainbow", "wave"];
-  const VIZ_STYLE_LABELS = { bars: "Bars", mirror: "Mirror", rainbow: "Rainbow", wave: "Wave" };
+  const VIZ_STYLES = ["bars", "mirror", "rainbow", "wave", "ring", "particles"];
+  const VIZ_STYLE_LABELS = { bars: "Bars", mirror: "Mirror", rainbow: "Rainbow", wave: "Wave", ring: "Ring", particles: "Particles" };
   state.vizStyle = ls.get("vizStyle", "bars");
   if (!VIZ_STYLES.includes(state.vizStyle)) state.vizStyle = "bars";
+  // Particle-burst state: a pool of live particles plus peak-detection memory.
+  const vizParticles = [];
+  let vizEnergyAvg = 0, vizLastEmit = 0;
 
   /** The frequency-bar heights (0..1), smoothed, for bar-based styles. */
   function vizBarTargets(ts) {
@@ -515,6 +647,8 @@
       case "mirror": return drawMirror(ts);
       case "rainbow": return drawRainbow(ts);
       case "wave": return drawWave(ts);
+      case "ring": return drawRing(ts);
+      case "particles": return drawParticles(ts);
       default: return drawBars(ts);
     }
   }
@@ -590,6 +724,83 @@
     vizCtx.strokeStyle = "#1ED760";
     vizCtx.lineJoin = "round";
     vizCtx.stroke();
+  }
+
+  function drawRing(ts) {
+    // Radial 360° spectrum — spikes grow outward from a central ring radius.
+    const t = vizBarTargets(ts);
+    const cx = vizW / 2, cy = vizH / 2;
+    const baseR = Math.min(vizW, vizH) * 0.17;
+    const maxLen = Math.min(vizW, vizH) * 0.30;
+    vizCtx.lineCap = "round";
+    vizCtx.lineWidth = Math.max(2, (2 * Math.PI * baseR) / VIZ_BARS * 0.55);
+    vizCtx.strokeStyle = vizGradient();
+    for (let i = 0; i < VIZ_BARS; i++) {
+      const ang = (i / VIZ_BARS) * Math.PI * 2 - Math.PI / 2;
+      const cos = Math.cos(ang), sin = Math.sin(ang);
+      const r1 = baseR + Math.max(3, t[i] * maxLen);
+      vizCtx.beginPath();
+      vizCtx.moveTo(cx + cos * baseR, cy + sin * baseR);
+      vizCtx.lineTo(cx + cos * r1, cy + sin * r1);
+      vizCtx.stroke();
+    }
+    // faint inner guide ring
+    vizCtx.beginPath();
+    vizCtx.arc(cx, cy, baseR, 0, Math.PI * 2);
+    vizCtx.lineWidth = 2;
+    vizCtx.strokeStyle = "rgba(30,215,96,.35)";
+    vizCtx.stroke();
+  }
+
+  function drawParticles(ts) {
+    // Particle burst — amplitude peaks eject particles that fly out and fade.
+    const t = vizBarTargets(ts);
+    let energy = 0;
+    for (let i = 0; i < VIZ_BARS; i++) energy += t[i];
+    energy /= VIZ_BARS;
+    vizEnergyAvg += (energy - vizEnergyAvg) * 0.08;       // slow envelope for peak detection
+    const cx = vizW / 2, cy = vizH / 2;
+
+    // Emit a burst when the level jumps above its recent average.
+    if (energy > vizEnergyAvg * 1.25 + 0.04 && ts - vizLastEmit > 55 && vizParticles.length < 260) {
+      vizLastEmit = ts;
+      const burst = 6 + Math.floor(energy * 20);
+      for (let k = 0; k < burst; k++) {
+        const ang = Math.random() * Math.PI * 2;
+        const speed = (0.6 + Math.random() * 2.4) * (0.5 + energy);
+        vizParticles.push({
+          x: cx, y: cy,
+          vx: Math.cos(ang) * speed, vy: Math.sin(ang) * speed,
+          life: 1, size: 1.5 + Math.random() * 2.5 + energy * 3,
+          hue: 120 + Math.random() * 180,
+        });
+      }
+    }
+
+    // Advance + draw each particle (velocity decay, slight gravity, fade-out).
+    for (let i = vizParticles.length - 1; i >= 0; i--) {
+      const p = vizParticles[i];
+      p.x += p.vx; p.y += p.vy;
+      p.vx *= 0.975; p.vy = p.vy * 0.975 + 0.015;
+      p.life -= 0.012;
+      if (p.life <= 0 || p.x < -12 || p.x > vizW + 12 || p.y < -12 || p.y > vizH + 12) {
+        vizParticles.splice(i, 1); continue;
+      }
+      vizCtx.globalAlpha = Math.max(0, p.life);
+      vizCtx.fillStyle = `hsl(${Math.round(p.hue)}, 85%, 58%)`;
+      vizCtx.beginPath();
+      vizCtx.arc(p.x, p.y, p.size * (0.4 + 0.6 * p.life), 0, Math.PI * 2);
+      vizCtx.fill();
+    }
+    vizCtx.globalAlpha = 1;
+
+    // Pulsing central core that scales with the current level.
+    const coreR = 4 + energy * Math.min(vizW, vizH) * 0.13;
+    const g = vizCtx.createRadialGradient(cx, cy, 0, cx, cy, coreR);
+    g.addColorStop(0, "rgba(30,215,96,.9)");
+    g.addColorStop(1, "rgba(23,201,192,0)");
+    vizCtx.fillStyle = g;
+    vizCtx.beginPath(); vizCtx.arc(cx, cy, coreR, 0, Math.PI * 2); vizCtx.fill();
   }
 
   function startViz() {
@@ -899,7 +1110,7 @@
     songList.innerHTML = `<div class="stats-loading">Loading listening stats…</div>`;
     let d = null;
     try {
-      const r = await fetch("/stats", { cache: "no-store" });
+      const r = await apiFetch("/stats", { cache: "no-store" });
       if (r.ok) d = await r.json();
     } catch {}
     if (state.view !== "stats") return; // user navigated away while fetching
@@ -1168,6 +1379,342 @@
     updateMediaSession();
     prefetchNext();            // warm the idle deck for the upcoming track
     savePlaybackState(true);   // persist the new current track for resume
+    // Server (AI) vocal removal: the deck above is playing the original; kick off
+    // (or reuse) a server-side separation and hot-swap to the instrumental when
+    // it's ready. Client mode needs nothing here — it's handled live in applyEffects.
+    if (stemsActive()) ensureStems(song);
+    else if (serverVocalActive()) ensureInstrumental(song);
+    else { aiJob.id = null; hideAiStatus(); }
+    prefetchAiNext();   // warm the next track's separation in the background
+  }
+
+  // ---- AI vocal removal (server-side Demucs) --------------------------------
+  // The browser plays the original immediately; meanwhile the server separates the
+  // track (slow) and we swap the deck to the vocal-free mix once it's ready. A job
+  // id guards against the user changing tracks or toggling the effect mid-prepare.
+  let aiJob = { id: null, stemsReadyId: null };
+
+  /** True when vocals should be removed on the SERVER (AI) for the current setup. */
+  function serverVocalActive() {
+    return state.eq.vocalRemove && state.eq.vocalMode === "server" && state.caps.aiInstrumental;
+  }
+
+  /** The track path to ask the server to separate. Mirrors the path the stream
+   *  uses (which is known to resolve, since playback works) — derive it from the
+   *  stream URL, dropping the "/stream/" prefix, and only fall back to song.path. */
+  function instrumentalRel(song) {
+    try {
+      const u = streamUrlFor(song);
+      if (u) {
+        const pathname = new URL(u, location.href).pathname;
+        const stripped = pathname.replace(/^.*?\/stream\//, "");
+        if (stripped && stripped !== pathname) return decodeURIComponent(stripped);
+      }
+    } catch {}
+    return relPathOf(song);
+  }
+
+  function instrumentalUrl(song) {
+    const rel = instrumentalRel(song);
+    if (!rel) return null;
+    return (apiBase() || "") + "/instrumental?path=" + encodeURIComponent(rel);
+  }
+
+  /** Swap the active deck to a URL, preserving position + play/pause state. */
+  function swapDeckSrc(url, keepPos) {
+    const d = act();
+    const pos = keepPos ? (d.currentTime || 0) : 0;
+    const wasPlaying = !d.paused;
+    const onMeta = () => {
+      d.removeEventListener("loadedmetadata", onMeta);
+      try { d.currentTime = Math.min(pos, (d.duration || pos)); } catch {}
+      if (wasPlaying) play();
+    };
+    d.addEventListener("loadedmetadata", onMeta);
+    d.src = url;
+    d.load();
+  }
+
+  // Preload an AI URL on the IDLE deck and switch only once it can play, at the
+  // given position — avoids the silent gap (and the error-skip) you get when you
+  // reload the ACTIVE deck while the server is still rendering the mix.
+  let _swapCleanup = null;
+  function smoothSwap(url, pos) {
+    if (!url) return;
+    if (!ac || fadeGains.length < 2) { swapDeckSrc(url, true); return; }  // no graph: fall back
+    if (_swapCleanup) { _swapCleanup(); _swapCleanup = null; }            // cancel a pending swap
+    const p = (typeof pos === "number") ? pos : (act().currentTime || 0);
+    const wasPlaying = !act().paused;
+    const incIndex = 1 - deckIndex;
+    const inc = decks[incIndex];
+    const oldDeck = decks[deckIndex];
+    crossfading = true;                 // suppress the end-of-track crossfade mid-swap
+    let done = false;
+    const cleanup = () => {
+      inc.removeEventListener("canplay", onReady);
+      inc.removeEventListener("error", onErr);
+      if (_swapCleanup === cleanup) _swapCleanup = null;
+    };
+    function onReady() {
+      if (done) return; done = true; cleanup();
+      try { inc.currentTime = p; } catch {}
+      inc.playbackRate = state.eq.speed;
+      inc.preservesPitch = state.eq.pitch;
+      inc.mozPreservesPitch = state.eq.pitch;
+      inc.webkitPreservesPitch = state.eq.pitch;
+      const now = ac.currentTime;
+      fadeGains[incIndex].gain.cancelScheduledValues(now); fadeGains[incIndex].gain.setValueAtTime(1, now);
+      fadeGains[deckIndex].gain.cancelScheduledValues(now); fadeGains[deckIndex].gain.setValueAtTime(0, now);
+      const finish = () => { try { oldDeck.pause(); } catch {} deckIndex = incIndex; crossfading = false; };
+      if (wasPlaying) { const pr = inc.play(); (pr && pr.then) ? pr.then(finish).catch(finish) : finish(); }
+      else finish();
+    }
+    function onErr() {
+      if (done) return; done = true; cleanup(); crossfading = false;
+      toast("Could not load AI audio");
+    }
+    _swapCleanup = cleanup;
+    inc.addEventListener("canplay", onReady);
+    inc.addEventListener("error", onErr);
+    inc.src = url; inc.load();
+  }
+
+  /** Fall back to the real-time (client) karaoke filter when AI isn't available. */
+  function fallbackToKaraoke() {
+    state.eq.vocalMode = "client";
+    state.eq.vocalRemove = true;
+    persistEq();
+    applyEffects();
+    const sel = $("#fx-vocal-mode"); if (sel) sel.value = "client";
+    const kv = $("#fx-vocal"); if (kv) kv.checked = true;
+    syncVocalUi();
+  }
+
+  async function ensureInstrumental(song) {
+    const rel = instrumentalRel(song);
+    if (!rel) return;
+    const myId = song.id;
+    aiJob.id = myId;
+    try {
+      let r = await apiFetch("/instrumental/prepare", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: rel }),
+      });
+      let st = await r.json().catch(() => null);
+      if (!st || st.status === "unsupported") {
+        toast("AI vocal removal needs Demucs on the server — using karaoke filter");
+        fallbackToKaraoke();
+        return;
+      }
+      if (st.status === "error") { hideAiStatus(); toast("AI vocal removal: " + (st.error || "failed")); return; }
+      if (st.status !== "ready") showAiStatus(st.progress);
+      // Poll until the server has the instrumental ready.
+      while (st.status !== "ready") {
+        if (aiJob.id !== myId || !serverVocalActive()) { hideAiStatus(); return; }  // track changed / toggled off
+        if (st.status === "error") { hideAiStatus(); toast("AI separation failed"); return; }
+        showAiStatus(st.progress);
+        await new Promise((res) => setTimeout(res, 1500));
+        const sr = await apiFetch("/instrumental/status?path=" + encodeURIComponent(rel), { cache: "no-store" });
+        st = await sr.json().catch(() => ({ status: "error" }));
+      }
+      hideAiStatus();
+      if (aiJob.id !== myId || !serverVocalActive()) return;
+      const cur = currentSong();
+      if (cur && cur.id === myId) {
+        smoothSwap(instrumentalUrl(song));
+        toast("AI instrumental ready ✓");
+      }
+    } catch {
+      hideAiStatus();
+      toast("AI vocal removal unavailable");
+    }
+  }
+
+  /** Show/update the persistent AI progress pill with a 0..100 percentage. */
+  function showAiStatus(pct, label) {
+    const box = $("#ai-status");
+    if (!box) return;
+    if (label) $("#ai-status-label").textContent = label;
+    const p = (typeof pct === "number" && pct >= 0) ? Math.min(100, Math.round(pct)) : 0;
+    $("#ai-status-pct").textContent = p > 0 ? p + "%" : "";
+    $("#ai-status-fill").style.width = p + "%";
+    box.hidden = false;
+  }
+  function hideAiStatus() {
+    const box = $("#ai-status");
+    if (box) box.hidden = true;
+  }
+
+  // ---- AI stem mixer (server-side Demucs 4-stem + ffmpeg re-mix) -------------
+  // Separates the track into vocals/drums/bass/other once, then re-mixes at the
+  // chosen per-stem volumes on the server (fast) and swaps the deck to the result.
+  let stemDebounce = null;
+
+  function stemsActive() { return state.stems.on && state.caps.stemMixer; }
+
+  function stemsMixUrl(song) {
+    const rel = instrumentalRel(song);
+    if (!rel) return null;
+    const s = state.stems;
+    return (apiBase() || "") + "/stems/mix?path=" + encodeURIComponent(rel) +
+      "&v=" + s.v + "&d=" + s.d + "&b=" + s.b + "&o=" + s.o;
+  }
+
+  async function ensureStems(song) {
+    const rel = instrumentalRel(song);
+    if (!rel) return;
+    const myId = song.id;
+    aiJob.id = myId;
+    aiJob.stemsReadyId = null;   // this track's stems aren't ready until separation finishes
+    try {
+      let r = await apiFetch("/stems/prepare", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: rel }),
+      });
+      let st = await r.json().catch(() => null);
+      if (!st || st.status === "unsupported") {
+        toast("AI stem mixer needs Demucs + ffmpeg on the server");
+        state.stems.on = false; ls.set("stems", state.stems); syncStemUi();
+        return;
+      }
+      if (st.status === "error") { toast("Stem mixer: " + (st.error || "failed")); return; }
+      if (st.status !== "ready") showAiStatus(st.progress, "Separating stems…");
+      while (st.status !== "ready") {
+        if (aiJob.id !== myId || !stemsActive()) { hideAiStatus(); return; }
+        if (st.status === "error") { hideAiStatus(); toast("Stem separation failed"); return; }
+        showAiStatus(st.progress, "Separating stems…");
+        await new Promise((res) => setTimeout(res, 1500));
+        const sr = await apiFetch("/stems/status?path=" + encodeURIComponent(rel), { cache: "no-store" });
+        st = await sr.json().catch(() => ({ status: "error" }));
+      }
+      hideAiStatus();
+      if (aiJob.id !== myId || !stemsActive()) return;
+      const cur = currentSong();
+      if (cur && cur.id === myId) {
+        aiJob.stemsReadyId = myId;   // now safe to request /stems/mix for this track
+        smoothSwap(stemsMixUrl(song));
+        toast("Stems ready ✓");
+      }
+    } catch { hideAiStatus(); toast("AI stem mixer unavailable"); }
+  }
+
+  /** Background prefetch: while the current track plays with an AI mode on, ask the
+   *  server to start separating the NEXT queued track so it's ready (or already
+   *  separating in parallel, with --ai-workers > 1) by the time it plays. */
+  function prefetchAiNext() {
+    try {
+      const stems = stemsActive(), vocal = serverVocalActive();
+      if (!stems && !vocal) return;
+      const np = nextOrderPos();
+      if (np < 0) return;
+      const s = state.queue[state.order[np]];
+      if (!s) return;
+      const rel = instrumentalRel(s);
+      if (!rel) return;
+      apiFetch(stems ? "/stems/prepare" : "/instrumental/prepare", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: rel }),
+      }).catch(() => {});   // fire-and-forget; no polling, no swap
+    } catch {}
+  }
+
+  /** Re-mix at the current slider values (stems already separated) and swap in. */
+  function applyStemMix() {
+    const song = currentSong();
+    if (!song || !stemsActive()) return;
+    // Only request a re-mix once THIS track's stems are separated. Before that,
+    // the slider values are just saved — ensureStems() applies the current gains
+    // automatically when separation finishes (so no 202 / "could not load" error).
+    if (aiJob.stemsReadyId !== song.id) return;
+    const url = stemsMixUrl(song);
+    if (url) smoothSwap(url);   // preload on the idle deck, switch gaplessly
+  }
+
+  function onStemToggle() {
+    const song = currentSong();
+    aiJob.stemsReadyId = null;
+    if (state.stems.on) {
+      // The stem mixer supersedes the simpler vocal-removal modes.
+      if (state.eq.vocalRemove) {
+        state.eq.vocalRemove = false; persistEq(); applyEffects();
+        const kv = $("#fx-vocal"); if (kv) kv.checked = false;
+      }
+      if (song) ensureStems(song);
+    } else {
+      aiJob.id = null; hideAiStatus();
+      const d = act();
+      if (song && d.src && d.src.indexOf("/stems/mix") !== -1) swapDeckSrc(streamUrlFor(song), true);
+    }
+  }
+
+  function applyStemPreset(name) {
+    const P = {
+      instrumental: { v: 0, d: 100, b: 100, o: 100 },
+      acapella: { v: 100, d: 0, b: 0, o: 0 },
+      nodrums: { v: 100, d: 0, b: 100, o: 100 },
+      original: { v: 100, d: 100, b: 100, o: 100 },
+    }[name];
+    if (!P) return;
+    Object.assign(state.stems, P);
+    ls.set("stems", state.stems);
+    syncStemUi();
+    if (stemsActive()) applyStemMix();
+  }
+
+  function syncStemUi() {
+    const wrap = $("#fx-stems-wrap");
+    if (wrap) wrap.hidden = !state.caps.stemMixer;
+    const on = $("#stem-on"); if (on) on.checked = state.stems.on;
+    [["v", "stem-v"], ["d", "stem-d"], ["b", "stem-b"], ["o", "stem-o"]].forEach(([k, id]) => {
+      const sl = $("#" + id); if (sl) sl.value = state.stems[k];
+      const vv = $("#" + id + "-val"); if (vv) vv.textContent = state.stems[k];
+    });
+    const sliders = $("#stem-sliders"); if (sliders) sliders.style.display = state.stems.on ? "" : "none";
+    const presets = document.querySelector(".stem-presets"); if (presets) presets.style.display = state.stems.on ? "" : "none";
+  }
+
+  /** React to the vocal-removal toggle/mode changing mid-track, without
+   *  restarting the queue. Client mode is handled live by applyEffects(); server
+   *  mode needs an instrumental prepared (or the deck reverted to the original). */
+  function onVocalChange() {
+    applyEffects();
+    const song = currentSong();
+    if (!song) return;
+    if (serverVocalActive()) {
+      ensureInstrumental(song);               // keep playing original until it's ready
+    } else {
+      aiJob.id = null;
+      hideAiStatus();
+      const d = act();
+      // If we were on a server-rendered instrumental, revert to the original mix.
+      if (d.src && d.src.indexOf("/instrumental?") !== -1) swapDeckSrc(streamUrlFor(song), true);
+    }
+  }
+
+  /** Update the vocal-removal sub-controls (strength visibility, mode availability,
+   *  the helper note) to match the current settings + server capability. */
+  function syncVocalUi() {
+    const sel = $("#fx-vocal-mode");
+    const serverOpt = sel && sel.querySelector('option[value="server"]');
+    if (serverOpt) {
+      serverOpt.disabled = !state.caps.aiInstrumental;
+      serverOpt.textContent = state.caps.aiInstrumental
+        ? "Server — AI (Demucs)" : "Server — AI (not installed)";
+    }
+    // Strength only applies to the real-time client filter.
+    const strengthRow = $("#fx-vocal-strength-row");
+    const strengthInput = $("#fx-vocal-strength");
+    const showStrength = state.eq.vocalMode === "client";
+    if (strengthRow) strengthRow.style.display = showStrength ? "" : "none";
+    if (strengthInput) strengthInput.style.display = showStrength ? "" : "none";
+    const note = $("#fx-vocal-note");
+    if (note) {
+      note.textContent = state.eq.vocalMode === "server"
+        ? (state.caps.aiInstrumental
+            ? "AI separation runs on the PC — much cleaner, but each track takes a while to prepare the first time."
+            : "This server has no AI separation (install Demucs). Switch to Client for real-time removal.")
+        : "Real-time in your browser — instant, but only cancels centre-panned vocals.";
+    }
   }
 
   /** Overlap into the next track for a seamless crossfade / gapless hand-off. */
@@ -1313,7 +1860,7 @@
     if (!song || song.id === lastScrobbledId) return;
     lastScrobbledId = song.id;
     try {
-      fetch("/scrobble", {
+      apiFetch("/scrobble", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1366,7 +1913,7 @@
   async function importDiskPlaylists() {
     let lists = null;
     try {
-      const r = await fetch("/playlists/disk", { cache: "no-store" });
+      const r = await apiFetch("/playlists/disk", { cache: "no-store" });
       if (r.ok) lists = await r.json();
     } catch {}
     if (!Array.isArray(lists)) { toast("Playlist import isn’t supported by this server"); return; }
@@ -1393,7 +1940,7 @@
     const paths = (pl.songs || []).map((s) => s.path).filter(Boolean);
     if (!paths.length) { toast("Playlist has no exportable tracks"); return; }
     try {
-      const r = await fetch("/playlists/export", {
+      const r = await apiFetch("/playlists/export", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name: pl.name, paths }),
@@ -1591,6 +2138,7 @@
       updateCounts();
       render();
       restoreScroll();         // jump back to where you were on reload
+      fetchCapabilities();     // capabilities belong to the server we just loaded from
       toast(`Loaded ${data.length} track${data.length === 1 ? "" : "s"}`);
     } catch (err) {
       toast("Could not load songs: " + err.message);
@@ -1655,9 +2203,26 @@
     const pc = $("#eq-presets"); pc.innerHTML = "";
     Object.keys(GENRE_PRESETS).forEach((name) => {
       const b = el("button", "preset" + (state.eq.preset === name ? " active" : ""), esc(name));
+      b.dataset.preset = name;
       b.addEventListener("click", () => applyPreset(name));
       pc.appendChild(b);
     });
+    // User-saved custom presets (each with a tiny delete affordance).
+    (state.userPresets || []).forEach((p) => {
+      const b = el("button", "preset user" + (state.eq.preset === p.name ? " active" : ""),
+                   esc(p.name) + ' <span class="preset-del" title="Delete preset">×</span>');
+      b.dataset.preset = p.name;
+      b.addEventListener("click", (ev) => {
+        if (ev.target.closest(".preset-del")) { deleteUserPreset(p.name); return; }
+        applyUserPreset(p);
+      });
+      pc.appendChild(b);
+    });
+    // "Save current EQ as a preset" chip.
+    const save = el("button", "preset save", "＋ Save");
+    save.title = "Save the current EQ curve as a custom preset";
+    save.addEventListener("click", saveUserPreset);
+    pc.appendChild(save);
     // Presets only make sense in graphic mode.
     pc.style.display = state.eq.eqMode === "parametric" ? "none" : "";
     // Bands (graphic sliders or a parametric control list, per state.eq.eqMode).
@@ -1678,7 +2243,14 @@
     $("#fx-crossfade").value = state.eq.crossfade;
     $("#fx-crossfade-val").textContent = state.eq.crossfade === 0 ? "Off" : state.eq.crossfade + "s";
     $("#fx-crossfeed").value = state.eq.crossfeed; $("#fx-crossfeed-val").textContent = state.eq.crossfeed;
+    $("#fx-vocal").checked = state.eq.vocalRemove;
+    $("#fx-vocal-mode").value = state.eq.vocalMode;
+    $("#fx-vocal-strength").value = state.eq.vocalStrength; $("#fx-vocal-val").textContent = state.eq.vocalStrength;
+    syncVocalUi();
+    $("#fx-surround3d").value = state.eq.surround3d; $("#fx-surround3d-val").textContent = state.eq.surround3d;
+    $("#fx-limiter").checked = state.eq.limiter;
     $("#fx-normalize").checked = state.eq.normalize;
+    syncStemUi();
   }
 
   /** Render the EQ band controls into #eq-bands for the active mode, with a
@@ -1749,7 +2321,37 @@
     });
   }
   function markPresetActive() {
-    $$("#eq-presets .preset").forEach((b) => b.classList.toggle("active", b.textContent === state.eq.preset));
+    $$("#eq-presets .preset").forEach((b) => b.classList.toggle("active", b.dataset.preset === state.eq.preset));
+  }
+  /** Apply a user-saved custom preset's gains to the EQ. */
+  function applyUserPreset(p) {
+    state.eq.preset = p.name;
+    const g = (p.gains || []).slice(0, EQ_FREQS.length).map((v) => Math.round(v || 0));
+    while (g.length < EQ_FREQS.length) g.push(0);
+    state.eq.gains = g;
+    $$("#eq-bands .eq-slider").forEach((sl) => { const i = +sl.dataset.i; sl.value = state.eq.gains[i]; });
+    $$("#eq-bands .eq-gain").forEach((x) => { const i = +x.dataset.i; const v = state.eq.gains[i]; x.textContent = (v > 0 ? "+" : "") + v; });
+    markPresetActive();
+    persistEq(); applyEffects();
+  }
+  function saveUserPreset() {
+    promptText("Save EQ preset", "Name this preset:", "My preset", (name) => {
+      name = name.trim();
+      if (!name || GENRE_PRESETS[name]) { toast("Pick a different name"); return; }
+      state.userPresets = (state.userPresets || []).filter((p) => p.name !== name);
+      state.userPresets.push({ name, gains: state.eq.gains.slice() });
+      ls.set("userPresets", state.userPresets);
+      state.eq.preset = name; persistEq();
+      buildEqPanel();
+      toast("Saved preset “" + name + "”");
+    });
+  }
+  function deleteUserPreset(name) {
+    state.userPresets = (state.userPresets || []).filter((p) => p.name !== name);
+    ls.set("userPresets", state.userPresets);
+    if (state.eq.preset === name) state.eq.preset = "Custom";
+    buildEqPanel();
+    toast("Deleted preset");
   }
   function applyPreset(name) {
     state.eq.preset = name;
@@ -1850,16 +2452,21 @@
     $("#tag-save").disabled = true;
     try {
       // 1) Save the tag fields (always — independent of any cover art).
-      const r = await fetch("/edit-tags", {
+      const r = await apiFetch("/edit-tags", {
         method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
       });
       const d = await r.json().catch(() => null);
-      if (!r.ok || !d || !d.ok) { toast((d && d.error) || "Could not save tags"); return; }
+      if (!r.ok || !d || !d.ok) {
+        const msg = (d && d.error) || (r.status === 404 ? "Server has no tag editor" : `Could not save tags (HTTP ${r.status})`);
+        console.warn("edit-tags failed:", r.status, d);
+        toast(msg);
+        return;
+      }
 
       // 2) Optionally embed cover art (failure here does NOT undo the tag save).
       if (file) {
         try {
-          const ar = await fetch("/edit-art?path=" + encodeURIComponent(relPath), {
+          const ar = await apiFetch("/edit-art?path=" + encodeURIComponent(relPath), {
             method: "POST", headers: { "Content-Type": file.type || "image/jpeg" }, body: file,
           });
           if (!ar.ok) toast("Tags saved, but cover art upload failed");
@@ -1984,7 +2591,7 @@
     if (s.album) params.set("album", s.album);
     if (s.duration) params.set("duration", String(s.duration));
     try {
-      const r = await fetch("/lyrics?" + params.toString(), { cache: "no-store" });
+      const r = await apiFetch("/lyrics?" + params.toString(), { cache: "no-store" });
       const d = await r.json();
       if (!d || !d.text) {
         body.innerHTML = `<div class="lyrics-empty">No lyrics found online or locally.<br><span style="font-size:12px">You can drop a <b>.lrc</b>/<b>.txt</b> next to the track.</span></div>`;
@@ -2185,6 +2792,17 @@
     fxBind("#fx-bass", "bass", "#fx-bass-val");
     fxBind("#fx-surround", "surround", "#fx-surround-val");
     fxBind("#fx-crossfeed", "crossfeed", "#fx-crossfeed-val");
+    $("#fx-vocal").addEventListener("change", (e) => {
+      state.eq.vocalRemove = e.target.checked; persistEq(); onVocalChange();
+    });
+    $("#fx-vocal-mode").addEventListener("change", (e) => {
+      state.eq.vocalMode = e.target.value; persistEq(); syncVocalUi(); onVocalChange();
+    });
+    $("#fx-vocal-strength").addEventListener("input", (e) => {
+      state.eq.vocalStrength = Number(e.target.value);
+      $("#fx-vocal-val").textContent = e.target.value;
+      persistEq(); applyEffects();
+    });
     $("#fx-speed").addEventListener("input", (e) => {
       state.eq.speed = Number(e.target.value) / 100;
       $("#fx-speed-val").textContent = state.eq.speed.toFixed(1) + "×";
@@ -2198,11 +2816,42 @@
       persistEq();
     });
     $("#fx-normalize").addEventListener("change", (e) => { state.eq.normalize = e.target.checked; persistEq(); applyEffects(); });
+    fxBind("#fx-surround3d", "surround3d", "#fx-surround3d-val");
+    $("#fx-limiter").addEventListener("change", (e) => { state.eq.limiter = e.target.checked; persistEq(); applyEffects(); });
+
+    // A/B bypass: toggle all tonal/spatial effects off for comparison.
+    $("#btn-ab").addEventListener("click", () => {
+      bypassAll = !bypassAll;
+      $("#btn-ab").classList.toggle("active", bypassAll);
+      applyEffects();
+      toast(bypassAll ? "Effects bypassed (A)" : "Effects on (B)");
+    });
+
+    // AI stem mixer: enable toggle, per-stem sliders (debounced re-mix), presets.
+    $("#stem-on").addEventListener("change", (e) => {
+      state.stems.on = e.target.checked; ls.set("stems", state.stems); syncStemUi(); onStemToggle();
+    });
+    [["v", "stem-v"], ["d", "stem-d"], ["b", "stem-b"], ["o", "stem-o"]].forEach(([k, id]) => {
+      const sl = $("#" + id);
+      if (!sl) return;
+      sl.addEventListener("input", (e) => {
+        state.stems[k] = Number(e.target.value);
+        $("#" + id + "-val").textContent = e.target.value;
+        ls.set("stems", state.stems);
+        clearTimeout(stemDebounce);
+        stemDebounce = setTimeout(() => { if (stemsActive()) applyStemMix(); }, 700);
+      });
+    });
+    $$(".stem-presets [data-stem-preset]").forEach((b) => {
+      b.addEventListener("click", () => applyStemPreset(b.dataset.stemPreset));
+    });
     $("#fx-reset").addEventListener("click", () => {
       state.eq = {
         enabled: true, preset: "Flat", gains: EQ_FREQS.map(() => 0), reverb: "OFF",
         wide: 0, bass: 0, surround: 0, speed: 1.0, pitch: true, volume: state.eq.volume,
-        crossfade: 0, normalize: false, crossfeed: 0, eqMode: "graphic",
+        crossfade: 0, normalize: false, crossfeed: 0,
+        vocalRemove: false, vocalStrength: 100, vocalMode: "client",
+        limiter: true, surround3d: 0, eqMode: "graphic",
         eqParam: EQ_FREQS.map((f, i) => ({
           type: i === 0 ? "lowshelf" : i === EQ_FREQS.length - 1 ? "highshelf" : "peaking",
           freq: f, gain: 0, q: 1.1,
@@ -2242,7 +2891,10 @@
         if (!crossfading && d.duration && isFinite(d.duration)) {
           ensureUpcoming();    // radio: extend the queue before it runs out
           const overlap = Math.max(Number(state.eq.crossfade) || 0, 0.4);
-          if (d.duration - d.currentTime <= overlap && state.repeat !== "ONE") startCrossfade();
+          // Skip crossfade while an AI mode is active — the deck is on a server
+          // render, and the next track gets its own AI pass via loadCurrent.
+          if (d.duration - d.currentTime <= overlap && state.repeat !== "ONE"
+              && !stemsActive() && !serverVocalActive()) startCrossfade();
         }
       });
       d.addEventListener("loadedmetadata", () => {
@@ -2260,6 +2912,14 @@
       d.addEventListener("error", () => {
         const s = currentSong();
         if (d !== act() || crossfading || !s) return;
+        // An AI render (instrumental / stem mix) failing must NOT skip the song —
+        // revert this deck to the original mix and keep playing.
+        const src = d.src || "";
+        if (src.indexOf("/instrumental?") !== -1 || src.indexOf("/stems/mix") !== -1) {
+          toast("AI audio error — playing original");
+          swapDeckSrc(streamUrlFor(s), true);
+          return;
+        }
         // Retry the same track once (transient network blip), then auto-skip.
         if (streamRecovery.id === s.id && !streamRecovery.retried) {
           streamRecovery.retried = true;
@@ -2386,20 +3046,35 @@
     fetchCapabilities();     // discover optional server features (tag editing, etc.)
   }
 
-  /** Ask the server what optional features it supports and reveal the matching UI. */
+  /** Ask the server what optional features it supports and reveal the matching UI.
+   *  Tries the catalog's server first, then falls back to same-origin so a stale
+   *  Connect URL can't wrongly hide the tag-editor affordances. */
   async function fetchCapabilities() {
-    try {
-      const r = await fetch("/capabilities", { cache: "no-store" });
-      if (!r.ok) return;
-      const d = await r.json();
-      state.caps = {
-        canEditTags: !!(d && d.canEditTags),
-        fts: !!(d && d.fts),
-        watch: !!(d && d.watch),
-      };
-    } catch { return; }
-    // Reveal tag-editing affordances now that we know they're supported.
-    if (state.caps.canEditTags) { render(); updateNowPlaying(); }
+    const urls = [];
+    if (apiBase()) urls.push(api("/capabilities"));
+    urls.push("/capabilities");   // same-origin fallback
+    let d = null;
+    for (const u of urls) {
+      try {
+        const r = await fetch(u, { cache: "no-store" });
+        if (r.ok) { d = await r.json(); break; }
+      } catch { /* try next */ }
+    }
+    if (!d) return;
+    state.caps = {
+      canEditTags: !!d.canEditTags,
+      fts: !!d.fts,
+      watch: !!d.watch,
+      aiInstrumental: !!d.aiInstrumental,
+      stemMixer: !!d.stemMixer,
+    };
+    // Enable/disable the "Server — AI" option and the stem mixer now that we know
+    // whether this server can actually run Demucs (+ ffmpeg).
+    syncVocalUi();
+    syncStemUi();
+    // Reflect whatever we learned (reveal OR hide the edit affordances).
+    render();
+    updateNowPlaying();
   }
 
   document.addEventListener("DOMContentLoaded", init);

@@ -339,10 +339,10 @@ input, select, button { color: inherit; }
 
 /* ---------------------------- Lyrics panel ---------------------------- */
 .lyrics-panel { width: 380px; }
-.lyrics-body { max-height: 56vh; overflow-y: auto; font-size: 14px; line-height: 1.9; color: var(--text-dim); white-space: pre-wrap; }
-.lyrics-body.synced { white-space: normal; }
-.lrc-line { transition: color .2s, opacity .2s; opacity: .7; }
-.lrc-line.active { color: var(--green); font-weight: 700; opacity: 1; }
+.lyrics-body { max-height: 56vh; overflow-y: auto; font-size: 20px; line-height: 1.9; color: var(--text-dim); white-space: pre-wrap; }
+.lyrics-body.synced { white-space: normal; font-size: 22px; }
+.lrc-line { transition: color .2s, opacity .2s, transform .2s; opacity: .6; padding: 3px 0; }
+.lrc-line.active { color: var(--green); font-weight: 800; opacity: 1; font-size: 26px; }
 .lyrics-empty { color: var(--text-faint); text-align: center; padding: 30px 10px; }
 
 /* ---------------------------- Full-page Now Playing ---------------------------- */
@@ -504,6 +504,23 @@ input[type="range"]::-moz-range-thumb {
 .fx label span { color: var(--green); font-weight: 800; }
 .fx select { background: var(--surface-2); border: 1px solid var(--outline); border-radius: 9px; padding: 8px 10px; font-size: 13px; }
 .fx-pitch { justify-content: space-between; }
+.fx-vocal-wrap { grid-column: 1 / -1; }
+.fx-note { font-size: 11.5px; color: var(--text-faint); font-weight: 600; }
+
+/* Custom EQ preset chips (save / user-saved with delete). */
+.preset.save { border-style: dashed; opacity: .85; }
+.preset.user .preset-del { margin-left: 7px; font-weight: 800; opacity: .55; }
+.preset.user .preset-del:hover { opacity: 1; color: #e5484d; }
+
+/* A/B bypass button active state. */
+.chip-btn.active { background: var(--green); color: #00210d; border-color: var(--green); }
+
+/* AI stem mixer. */
+.fx-stems { grid-column: 1 / -1; border-top: 1px solid var(--outline); padding-top: 14px; margin-top: 2px; }
+.stem-sliders { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 16px; margin-top: 10px; }
+.stem-sliders label { display: flex; flex-direction: column; gap: 5px; font-size: 12.5px; color: var(--text-dim); font-weight: 600; }
+.stem-sliders label span { color: var(--green); font-weight: 800; }
+.stem-presets { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 
 .queue-panel { width: 400px; }
 .queue-list { display: flex; flex-direction: column; gap: 2px; }
@@ -537,6 +554,18 @@ input[type="range"]::-moz-range-thumb {
   background: var(--surface-3); color: var(--text); padding: 11px 18px; border-radius: 30px;
   font-size: 13.5px; font-weight: 600; box-shadow: var(--shadow); z-index: 90; animation: pop .16s ease;
 }
+
+/* Persistent AI vocal-removal progress pill (shown while Demucs runs). */
+.ai-status {
+  position: fixed; left: 50%; bottom: calc(var(--nowbar-h) + 64px); transform: translateX(-50%);
+  background: var(--surface-2); border: 1px solid var(--outline); color: var(--text);
+  padding: 10px 16px 12px; border-radius: 14px; box-shadow: var(--shadow); z-index: 95;
+  min-width: 240px; text-align: center; animation: pop .16s ease;
+}
+.ai-status-label { font-size: 13px; font-weight: 700; }
+.ai-status-pct { font-size: 13px; font-weight: 800; color: var(--green); margin-left: 6px; }
+.ai-status-track { margin-top: 8px; height: 6px; border-radius: 6px; background: var(--surface-3); overflow: hidden; }
+.ai-status-fill { height: 100%; width: 0%; border-radius: 6px; background: var(--green); transition: width .3s ease; }
 
 /* ---------------------------- Responsive ---------------------------- */
 @media (max-width: 860px) {

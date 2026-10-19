@@ -42,9 +42,12 @@ import json
 import mimetypes
 import os
 import re
+import shutil
 import socket
 import sqlite3
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -701,7 +704,8 @@ def edit_tags(rel: str, fields: dict):
     """Write editable tags into a file via mutagen; refresh the catalog afterwards."""
     p = _resolve_rel(rel)
     if not p:
-        return {"ok": False, "error": "file not found"}
+        print(f"  [edit-tags] file not found: rel={rel!r} MUSIC_DIR={MUSIC_DIR!r}", file=sys.stderr)
+        return {"ok": False, "error": f"file not found for '{rel}'"}
     try:
         audio = MutagenFile(p, easy=True)
         if audio is None:
@@ -1224,6 +1228,421 @@ a.open{{display:inline-block;margin-top:1rem;background:#1ED760;color:#00210D;fo
 
 
 # ---------------------------------------------------------------------------
+# AI vocal removal (server-side stem separation via Demucs)
+# ---------------------------------------------------------------------------
+# The browser's real-time "karaoke" filter only cancels dead-centre content, so
+# any reverb/panned vocal bleeds through. This instead runs a neural source-
+# separation model (Demucs) on the PC to split the track into vocals + the rest
+# and streams back the vocal-free "instrumental" mix. Separation is slow (seconds
+# to minutes per track on CPU; far faster on an NVIDIA GPU), so results are cached
+# on disk and produced by a single background worker the browser polls.
+
+STEM_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stem_cache")
+DEMUCS_MODEL = "htdemucs"     # Demucs v4 default model
+AI_DEVICE = None              # None = auto (CUDA if available, else CPU); or "cuda"/"cpu"
+ENABLE_AI = True              # toggled off by --no-ai
+AI_WORKERS = 1                # how many Demucs separations may run in parallel
+
+STEM_NAMES = ("vocals", "drums", "bass", "other")
+
+# Two independent job registries (instrumental = 2-stem; stems = full 4-stem),
+# both fed by a shared queue drained by AI_WORKERS background threads. A single
+# Demucs pass already produces every stem, so there is nothing to parallelise
+# *within* one track — AI_WORKERS only lets DIFFERENT tracks separate at once
+# (e.g. the current track + a prefetched upcoming one).
+_STEM_JOBS = {}               # key -> {status,out,error,progress}  (instrumental)
+_STEM4_JOBS = {}              # key -> {status,error,progress}      (4-stem mixer)
+_STEM_JOBS_LOCK = threading.Lock()
+_STEM_QUEUE = None            # queue.Queue of 0-arg task callables, created lazily
+_STEM_WORKERS = []            # the worker threads
+
+
+def demucs_available() -> bool:
+    """True when Demucs can be used (installed and AI not disabled)."""
+    if not ENABLE_AI:
+        return False
+    try:
+        import importlib.util
+        return importlib.util.find_spec("demucs") is not None
+    except Exception:
+        return False
+
+
+FFMPEG_PATH = None     # explicit override from --ffmpeg
+_FFMPEG_CACHE = None    # memoised resolved path
+
+
+def _ffmpeg() -> str:
+    """Path to ffmpeg (needed to mix stems), or None if not found.
+
+    Tries, in order: an explicit --ffmpeg path, the PATH, and finally common
+    install locations (winget / choco / scoop / C:\\ffmpeg) — so the mixer works
+    even when the server's PATH is stale (e.g. ffmpeg installed after launch)."""
+    global _FFMPEG_CACHE
+    if _FFMPEG_CACHE and os.path.isfile(_FFMPEG_CACHE):
+        return _FFMPEG_CACHE
+    if FFMPEG_PATH and os.path.isfile(FFMPEG_PATH):
+        _FFMPEG_CACHE = FFMPEG_PATH
+        return _FFMPEG_CACHE
+    found = shutil.which("ffmpeg")
+    if found:
+        _FFMPEG_CACHE = found
+        return found
+    import glob
+    cands = []
+    la = os.environ.get("LOCALAPPDATA", "")
+    if la:
+        cands += glob.glob(os.path.join(la, "Microsoft", "WinGet", "Packages",
+                                        "Gyan.FFmpeg*", "**", "ffmpeg.exe"), recursive=True)
+    pd = os.environ.get("ProgramData", "")
+    if pd:
+        cands.append(os.path.join(pd, "chocolatey", "bin", "ffmpeg.exe"))
+    up = os.environ.get("USERPROFILE", "")
+    if up:
+        cands += glob.glob(os.path.join(up, "scoop", "apps", "ffmpeg", "**", "ffmpeg.exe"), recursive=True)
+    cands += glob.glob(r"C:\ffmpeg\**\ffmpeg.exe", recursive=True)
+    for c in cands:
+        if os.path.isfile(c):
+            _FFMPEG_CACHE = c
+            return c
+    return None
+
+
+def _stem_key(abs_path: str) -> str:
+    """Cache key for a track (invalidates when the file changes)."""
+    try:
+        st = os.stat(abs_path)
+        sig = f"{abs_path}|{st.st_mtime}|{st.st_size}"
+    except OSError:
+        sig = abs_path
+    return hashlib.sha1(sig.encode("utf-8")).hexdigest()
+
+
+def _instrumental_file(key: str) -> str:
+    return os.path.join(STEM_CACHE_DIR, key + ".mp3")
+
+
+def _stem_dir(key: str) -> str:
+    return os.path.join(STEM_CACHE_DIR, key)
+
+
+def _stems_ready(key: str) -> bool:
+    d = _stem_dir(key)
+    return all(os.path.isfile(os.path.join(d, s + ".mp3")) for s in STEM_NAMES)
+
+
+def _resolve_track(rel: str):
+    """Resolve a track reference (id / path / stream path) to a real file."""
+    return _resolve_rel(rel) or safe_resolve(MUSIC_DIR, rel or "")
+
+
+def _set_progress(key: str, pct: int):
+    """Record an instrumental job's progress (0..100) for the status endpoint."""
+    with _STEM_JOBS_LOCK:
+        job = _STEM_JOBS.setdefault(key, {"status": "processing", "out": None, "error": None})
+        job["progress"] = max(0, min(100, int(pct)))
+        if job.get("status") in (None, "idle"):
+            job["status"] = "processing"
+
+
+def _set_progress4(key: str, pct: int):
+    """Record a 4-stem job's progress (0..100) for the status endpoint."""
+    with _STEM_JOBS_LOCK:
+        job = _STEM4_JOBS.setdefault(key, {"status": "processing", "error": None})
+        job["progress"] = max(0, min(100, int(pct)))
+        if job.get("status") in (None, "idle"):
+            job["status"] = "processing"
+
+
+def _demucs_env():
+    """Env for a Demucs subprocess that caps its math-thread count to the CPU's
+    fair share (total threads / AI_WORKERS) — without this, parallel workers would
+    oversubscribe the CPU and gain nothing."""
+    env = os.environ.copy()
+    try:
+        per = max(1, (os.cpu_count() or 2) // max(1, int(AI_WORKERS)))
+    except Exception:
+        per = 1
+    for k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS",
+              "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        env[k] = str(per)
+    return env
+
+
+def _demucs_stream(cmd, name, progress_cb):
+    """Run a Demucs command, parsing its tqdm "NN%" output live via `progress_cb`.
+    Demucs renders the bar to stderr with carriage returns, so read char-by-char."""
+    print(f"  [ai] separating: {name}", file=sys.stderr)
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1, encoding="utf-8", errors="replace",
+        env=_demucs_env(),
+    )
+    pat = re.compile(r"(\d+)%")
+    buf, tail, last = "", "", -1
+    while True:
+        ch = proc.stdout.read(1)
+        if ch == "":
+            if proc.poll() is not None:
+                break
+            continue
+        if ch in ("\r", "\n"):
+            line = buf.strip()
+            buf = ""
+            if line:
+                tail = line
+                m = pat.search(line)
+                if m:
+                    pct = int(m.group(1))
+                    progress_cb(pct)
+                    if pct != last and (pct % 5 == 0 or pct == 99):
+                        last = pct
+                        print(f"  [ai] {name} — {pct}%", file=sys.stderr)
+        else:
+            buf += ch
+    rc = proc.wait()
+    if rc != 0:
+        raise RuntimeError(tail or f"demucs exited {rc}")
+
+
+def _run_demucs(abs_path: str, key: str) -> str:
+    """Separate `abs_path` into a vocal-free mix (2-stem), cached at _instrumental_file(key)."""
+    out_final = _instrumental_file(key)
+    if os.path.isfile(out_final):
+        _set_progress(key, 100)
+        return out_final
+    os.makedirs(STEM_CACHE_DIR, exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix="demucs_", dir=STEM_CACHE_DIR)
+    try:
+        cmd = [sys.executable, "-m", "demucs", "--two-stems", "vocals",
+               "-n", DEMUCS_MODEL, "--mp3", "-o", tmp]
+        if AI_DEVICE:
+            cmd += ["-d", AI_DEVICE]
+        cmd.append(abs_path)
+        _set_progress(key, 0)
+        _demucs_stream(cmd, os.path.basename(abs_path), lambda p: _set_progress(key, p))
+        # Demucs writes <tmp>/<model>/<trackname>/no_vocals.mp3
+        found = None
+        for root, _dirs, files in os.walk(tmp):
+            for f in files:
+                if f.lower().startswith("no_vocals"):
+                    found = os.path.join(root, f)
+                    break
+            if found:
+                break
+        if not found:
+            raise RuntimeError("demucs produced no instrumental stem")
+        shutil.move(found, out_final)
+        _set_progress(key, 100)
+        print(f"  [ai] done -> {out_final}", file=sys.stderr)
+        return out_final
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _run_demucs_4(abs_path: str, key: str) -> str:
+    """Full 4-stem separation (vocals/drums/bass/other), cached under _stem_dir(key)."""
+    sdir = _stem_dir(key)
+    if _stems_ready(key):
+        _set_progress4(key, 100)
+        return sdir
+    os.makedirs(STEM_CACHE_DIR, exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix="demucs4_", dir=STEM_CACHE_DIR)
+    try:
+        cmd = [sys.executable, "-m", "demucs", "-n", DEMUCS_MODEL, "--mp3", "-o", tmp]
+        if AI_DEVICE:
+            cmd += ["-d", AI_DEVICE]
+        cmd.append(abs_path)
+        _set_progress4(key, 0)
+        _demucs_stream(cmd, os.path.basename(abs_path) + " [stems]", lambda p: _set_progress4(key, p))
+        # Demucs writes <tmp>/<model>/<trackname>/{vocals,drums,bass,other}.mp3
+        srcdir = None
+        for root, _dirs, files in os.walk(tmp):
+            if any(f.lower().startswith("vocals") for f in files):
+                srcdir = root
+                break
+        if not srcdir:
+            raise RuntimeError("demucs produced no stems")
+        os.makedirs(sdir, exist_ok=True)
+        for stem in STEM_NAMES:
+            moved = False
+            for f in os.listdir(srcdir):
+                if f.lower().startswith(stem):
+                    shutil.move(os.path.join(srcdir, f), os.path.join(sdir, stem + ".mp3"))
+                    moved = True
+                    break
+            if not moved:
+                raise RuntimeError(f"missing '{stem}' stem")
+        _set_progress4(key, 100)
+        print(f"  [stems] done -> {sdir}", file=sys.stderr)
+        return sdir
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def mix_stems(key: str, gains) -> str:
+    """Mix the 4 cached stems at `gains` (v,d,b,o each 0..100) into one mp3, cached."""
+    v, d, b, o = (max(0, min(100, int(g))) for g in gains)
+    out = os.path.join(_stem_dir(key), f"mix_{v}_{d}_{b}_{o}.mp3")
+    if os.path.isfile(out):
+        return out
+    ff = _ffmpeg()
+    if not ff:
+        raise RuntimeError("ffmpeg not found (needed to mix stems)")
+    sdir = _stem_dir(key)
+    ins = []
+    for stem in STEM_NAMES:
+        ins += ["-i", os.path.join(sdir, stem + ".mp3")]
+    fc = (f"[0:a]volume={v/100:.3f}[a0];[1:a]volume={d/100:.3f}[a1];"
+          f"[2:a]volume={b/100:.3f}[a2];[3:a]volume={o/100:.3f}[a3];"
+          f"[a0][a1][a2][a3]amix=inputs=4:normalize=0[out]")
+    cmd = [ff, "-nostdin", "-y", *ins, "-filter_complex", fc,
+           "-map", "[out]", "-ac", "2", "-b:a", "256k", out]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          stdin=subprocess.DEVNULL)
+    if proc.returncode != 0:
+        try:
+            if os.path.isfile(out):
+                os.remove(out)
+        except OSError:
+            pass
+        raise RuntimeError((proc.stdout or b"").decode("utf-8", "replace")[-400:] or "ffmpeg mix failed")
+    return out
+
+
+def _ensure_worker():
+    global _STEM_QUEUE, _STEM_WORKERS
+    if _STEM_QUEUE is None:
+        import queue
+        _STEM_QUEUE = queue.Queue()
+    # Keep exactly max(1, AI_WORKERS) live worker threads draining the queue.
+    _STEM_WORKERS = [t for t in _STEM_WORKERS if t.is_alive()]
+    want = max(1, int(AI_WORKERS))
+    while len(_STEM_WORKERS) < want:
+        t = threading.Thread(target=_stem_worker_loop, daemon=True)
+        t.start()
+        _STEM_WORKERS.append(t)
+
+
+def _stem_worker_loop():
+    while True:
+        task = _STEM_QUEUE.get()
+        try:
+            task()
+        except Exception as exc:
+            print(f"  [ai] worker task failed: {exc}", file=sys.stderr)
+        finally:
+            _STEM_QUEUE.task_done()
+
+
+def _job_instrumental(key, abs_path):
+    try:
+        out = _run_demucs(abs_path, key)
+        with _STEM_JOBS_LOCK:
+            _STEM_JOBS[key] = {"status": "ready", "out": out, "error": None, "progress": 100}
+    except Exception as exc:
+        with _STEM_JOBS_LOCK:
+            _STEM_JOBS[key] = {"status": "error", "out": None, "error": str(exc), "progress": 0}
+        print(f"  [ai] separation failed: {exc}", file=sys.stderr)
+
+
+def _job_stems(key, abs_path):
+    try:
+        _run_demucs_4(abs_path, key)
+        with _STEM_JOBS_LOCK:
+            _STEM4_JOBS[key] = {"status": "ready", "error": None, "progress": 100}
+    except Exception as exc:
+        with _STEM_JOBS_LOCK:
+            _STEM4_JOBS[key] = {"status": "error", "error": str(exc), "progress": 0}
+        print(f"  [stems] separation failed: {exc}", file=sys.stderr)
+
+
+def request_instrumental(rel: str) -> dict:
+    """Queue an AI instrumental (2-stem) job for a track (idempotent)."""
+    if not demucs_available():
+        return {"status": "unsupported", "error": "Demucs is not installed on the server"}
+    abs_path = _resolve_track(rel)
+    if not abs_path:
+        print(f"  [ai] file not found: rel={rel!r} MUSIC_DIR={MUSIC_DIR!r}", file=sys.stderr)
+        return {"status": "error", "error": f"file not found for '{rel}' under {MUSIC_DIR}"}
+    key = _stem_key(abs_path)
+    if os.path.isfile(_instrumental_file(key)):
+        with _STEM_JOBS_LOCK:
+            _STEM_JOBS[key] = {"status": "ready", "out": _instrumental_file(key), "error": None, "progress": 100}
+        return {"status": "ready", "key": key, "progress": 100}
+    with _STEM_JOBS_LOCK:
+        job = _STEM_JOBS.get(key)
+        if job and job["status"] in ("processing", "ready"):
+            return {"status": job["status"], "key": key, "progress": job.get("progress", 0)}
+        _STEM_JOBS[key] = {"status": "processing", "out": None, "error": None, "progress": 0}
+    _ensure_worker()
+    _STEM_QUEUE.put(lambda: _job_instrumental(key, abs_path))
+    return {"status": "processing", "key": key, "progress": 0}
+
+
+def instrumental_status(rel: str) -> dict:
+    """Report the AI instrumental status for a track without queuing new work."""
+    if not demucs_available():
+        return {"status": "unsupported"}
+    abs_path = _resolve_track(rel)
+    if not abs_path:
+        return {"status": "error", "error": "file not found"}
+    key = _stem_key(abs_path)
+    if os.path.isfile(_instrumental_file(key)):
+        return {"status": "ready", "key": key, "progress": 100}
+    with _STEM_JOBS_LOCK:
+        job = _STEM_JOBS.get(key)
+    if job:
+        return {"status": job["status"], "key": key,
+                "error": job.get("error"), "progress": job.get("progress", 0)}
+    return {"status": "idle", "key": key, "progress": 0}
+
+
+def request_stems(rel: str) -> dict:
+    """Queue a full 4-stem separation for a track (idempotent)."""
+    if not demucs_available():
+        return {"status": "unsupported", "error": "Demucs is not installed on the server"}
+    if not _ffmpeg():
+        return {"status": "unsupported", "error": "ffmpeg not found (needed to mix stems)"}
+    abs_path = _resolve_track(rel)
+    if not abs_path:
+        return {"status": "error", "error": f"file not found for '{rel}' under {MUSIC_DIR}"}
+    key = _stem_key(abs_path)
+    if _stems_ready(key):
+        with _STEM_JOBS_LOCK:
+            _STEM4_JOBS[key] = {"status": "ready", "error": None, "progress": 100}
+        return {"status": "ready", "key": key, "progress": 100}
+    with _STEM_JOBS_LOCK:
+        job = _STEM4_JOBS.get(key)
+        if job and job["status"] in ("processing", "ready"):
+            return {"status": job["status"], "key": key, "progress": job.get("progress", 0)}
+        _STEM4_JOBS[key] = {"status": "processing", "error": None, "progress": 0}
+    _ensure_worker()
+    _STEM_QUEUE.put(lambda: _job_stems(key, abs_path))
+    return {"status": "processing", "key": key, "progress": 0}
+
+
+def stems_status(rel: str) -> dict:
+    """Report 4-stem separation status for a track without queuing new work."""
+    if not demucs_available():
+        return {"status": "unsupported"}
+    if not _ffmpeg():
+        return {"status": "unsupported", "error": "ffmpeg not found"}
+    abs_path = _resolve_track(rel)
+    if not abs_path:
+        return {"status": "error", "error": "file not found"}
+    key = _stem_key(abs_path)
+    if _stems_ready(key):
+        return {"status": "ready", "key": key, "progress": 100}
+    with _STEM_JOBS_LOCK:
+        job = _STEM4_JOBS.get(key)
+    if job:
+        return {"status": job["status"], "key": key,
+                "error": job.get("error"), "progress": job.get("progress", 0)}
+    return {"status": "idle", "key": key, "progress": 0}
+
+
+# ---------------------------------------------------------------------------
 # Request handler
 # ---------------------------------------------------------------------------
 
@@ -1289,6 +1708,18 @@ class WebPlayerHandler(BaseHTTPRequestHandler):
                 res = export_playlist(d.get("name") or "playlist", d.get("paths") or [])
                 self._send_json(res, HTTPStatus.OK if res.get("ok") else HTTPStatus.BAD_REQUEST)
                 return
+            if path == "/instrumental/prepare":
+                d = json.loads(self._read_body() or b"{}")
+                res = request_instrumental(d.get("path") or "")
+                code = HTTPStatus.OK if res.get("status") != "error" else HTTPStatus.BAD_REQUEST
+                self._send_json(res, code)
+                return
+            if path == "/stems/prepare":
+                d = json.loads(self._read_body() or b"{}")
+                res = request_stems(d.get("path") or "")
+                code = HTTPStatus.OK if res.get("status") != "error" else HTTPStatus.BAD_REQUEST
+                self._send_json(res, code)
+                return
             if path == "/edit-tags":
                 if mutagen is None:
                     self._send_json({"ok": False, "error": "mutagen not installed"},
@@ -1335,6 +1766,8 @@ class WebPlayerHandler(BaseHTTPRequestHandler):
                     "canEditTags": mutagen is not None,
                     "fts": _HAS_FTS,
                     "watch": True,
+                    "aiInstrumental": demucs_available(),
+                    "stemMixer": demucs_available() and bool(_ffmpeg()),
                 }).encode("utf-8")
                 self._send_bytes(body, "application/json; charset=utf-8")
                 return
@@ -1375,6 +1808,47 @@ class WebPlayerHandler(BaseHTTPRequestHandler):
                 self._serve_art((qs.get("artist") or [""])[0],
                                 (qs.get("album") or [""])[0],
                                 (qs.get("path") or [""])[0])
+                return
+            if path == "/instrumental/status":
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                rel = (qs.get("path") or [""])[0]
+                self._send_json(instrumental_status(rel))
+                return
+            if path == "/instrumental":
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                rel = (qs.get("path") or [""])[0]
+                st = instrumental_status(rel)
+                if st.get("status") == "idle":
+                    st = request_instrumental(rel)   # start it if nobody has yet
+                if st.get("status") == "ready":
+                    self._serve_media(_instrumental_file(st["key"]))
+                else:
+                    # Not ready: ask the client to poll /instrumental/status.
+                    self._send_json(st, HTTPStatus.ACCEPTED)
+                return
+            if path == "/stems/status":
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                self._send_json(stems_status((qs.get("path") or [""])[0]))
+                return
+            if path == "/stems/mix":
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                rel = (qs.get("path") or [""])[0]
+                g = lambda k, dv: int(float((qs.get(k) or [dv])[0]))
+                st = stems_status(rel)
+                if st.get("status") == "idle":
+                    st = request_stems(rel)          # start separation if needed
+                if st.get("status") != "ready":
+                    self._send_json(st, HTTPStatus.ACCEPTED)
+                    return
+                gains = (g("v", "100"), g("d", "100"), g("b", "100"), g("o", "100"))
+                try:
+                    out = mix_stems(st["key"], gains)
+                except Exception as exc:
+                    print(f"  [stems] mix failed (v,d,b,o={gains}): {exc}", file=sys.stderr)
+                    self._send_json({"status": "error", "error": str(exc)},
+                                    HTTPStatus.INTERNAL_SERVER_ERROR)
+                    return
+                self._serve_media(out)
                 return
             if path.startswith("/stream/"):
                 self._serve_file(path[len("/stream"):])
@@ -1441,6 +1915,10 @@ class WebPlayerHandler(BaseHTTPRequestHandler):
         if not file_path:
             self._send_error_text(HTTPStatus.NOT_FOUND, "404 Not Found")
             return
+        self._serve_media(file_path)
+
+    def _serve_media(self, file_path):
+        """Stream any on-disk media file with full HTTP Range (206) support."""
         try:
             file_size = os.path.getsize(file_path)
         except OSError:
@@ -1616,6 +2094,11 @@ def print_banner(ip, port, music_dir, track_count, watch_mode="off"):
     print(f"  Folder watch : {watch_mode}")
     print(f"  SQLite index : {DB_PATH} (FTS5 {'ON' if _HAS_FTS else 'OFF -> LIKE search'})")
     print(f"  Tag editor   : {'ON (mutagen)' if mutagen is not None else 'OFF (install mutagen to enable)'}")
+    _ai = demucs_available()
+    print(f"  AI vocals    : {('ON (Demucs' + (' / ' + AI_DEVICE if AI_DEVICE else ' / auto device') + f', {AI_WORKERS} worker(s))') if _ai else ('OFF (' + ('disabled by --no-ai' if not ENABLE_AI else 'pip install demucs to enable') + ')')}")
+    _ff = _ffmpeg()
+    if _ai:
+        print(f"  Stem mixer   : {('ON (ffmpeg: ' + _ff + ')') if _ff else 'OFF (ffmpeg not found — add it to PATH or pass --ffmpeg)'}")
     if mutagen is None:
         print()
         print("  (mutagen not installed: year/genre/duration come from metadata.json;")
@@ -1646,6 +2129,17 @@ def main():
                         help="Folder to cache downloaded lyrics (default: ./lyrics_cache).")
     parser.add_argument("--no-watch", action="store_true",
                         help="Disable the live folder watcher (manual /rescan only).")
+    parser.add_argument("--no-ai", action="store_true",
+                        help="Disable AI vocal removal even if Demucs is installed.")
+    parser.add_argument("--stem-cache", default=None,
+                        help="Folder to cache AI instrumentals (default: ./stem_cache).")
+    parser.add_argument("--ai-device", default=None,
+                        help="Demucs device: 'cuda' (GPU) or 'cpu' (default: auto-detect).")
+    parser.add_argument("--ai-workers", type=int, default=1,
+                        help="How many AI separations may run in parallel (default 1; "
+                             ">1 only helps on strong multi-core/GPU machines).")
+    parser.add_argument("--ffmpeg", default=None,
+                        help="Full path to ffmpeg.exe (for the stem mixer) if it isn't on PATH.")
     parser.add_argument("--db", default=None,
                         help="Path to the SQLite index/scrobble DB (default: ./library.db).")
     parser.add_argument("--lastfm-key", default=None, help="Last.fm API key (optional scrobble push).")
@@ -1655,6 +2149,14 @@ def main():
 
     global MUSIC_DIR, BASE_URL, ONLINE_ART, ART_CACHE_DIR, ONLINE_LYRICS, LYRICS_CACHE_DIR
     global DB_PATH, LASTFM_API_KEY, LASTFM_SECRET, LASTFM_SESSION
+    global ENABLE_AI, STEM_CACHE_DIR, AI_DEVICE, FFMPEG_PATH, AI_WORKERS
+    ENABLE_AI = not args.no_ai
+    if args.stem_cache:
+        STEM_CACHE_DIR = os.path.abspath(os.path.expanduser(args.stem_cache))
+    AI_DEVICE = args.ai_device
+    AI_WORKERS = max(1, int(args.ai_workers))
+    if args.ffmpeg:
+        FFMPEG_PATH = os.path.abspath(os.path.expanduser(args.ffmpeg))
     ONLINE_ART = not args.no_online_art
     if args.art_cache:
         ART_CACHE_DIR = os.path.abspath(os.path.expanduser(args.art_cache))

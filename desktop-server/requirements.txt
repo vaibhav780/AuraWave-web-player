@@ -6,3 +6,13 @@ Flask==3.0.3           # lightweight HTTP + JSON API framework
 waitress==3.0.0        # production-grade, pure-Python WSGI server (Windows-friendly)
 qrcode==7.4.2          # generates the "scan to connect" QR code (pure-Python, no Pillow needed)
 mutagen==1.47.0        # reads embedded audio tags (year / composer / genre / track number)
+
+# --- Optional: AI vocal removal + stem mixer (server-side Demucs) ------------
+# NOT installed by run.bat (large ~1GB download). To enable the AI features,
+# install Demucs INTO THIS venv and have ffmpeg on PATH:
+#     .venv\Scripts\python.exe -m pip install demucs
+#     winget install Gyan.FFmpeg          (or put ffmpeg.exe on PATH)
+# For a GPU, install the CUDA build of torch first, then demucs. The server
+# auto-detects both and reports them via /capabilities (aiInstrumental/stemMixer).
+# Env vars: AURAWAVE_AI_DEVICE=cuda|cpu, AURAWAVE_AI_WORKERS=N, AURAWAVE_FFMPEG=<path>
+# demucs
