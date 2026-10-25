@@ -67,6 +67,31 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     mutagen = None
 
+# pystray + Pillow power the "minimize to system tray" feature (the window hides
+# into the Windows notification area / hidden-icons flyout instead of quitting).
+# Both are OPTIONAL: if either is missing the app simply closes normally on X,
+# exactly as before.
+try:
+    import pystray  # type: ignore
+    from PIL import Image, ImageDraw  # type: ignore
+    TRAY_AVAILABLE = True
+except Exception:  # pragma: no cover - optional dependency
+    pystray = None
+    TRAY_AVAILABLE = False
+
+try:
+    from service_manager import (
+        get_service_status,
+        install_service,
+        uninstall_service,
+        start_service as svc_start,
+        stop_service as svc_stop,
+        is_port_in_use,
+    )
+    SERVICE_MANAGER_AVAILABLE = True
+except Exception:
+    SERVICE_MANAGER_AVAILABLE = False
+
 
 # ---------------------------------------------------------------------------
 # Configuration constants
@@ -87,6 +112,38 @@ MIME_TYPES = {
 }
 
 DEFAULT_PORT = 8080
+DEFAULT_MUSIC_FOLDER = os.environ.get("AURAWAVE_MUSIC_FOLDER", r"D:\songs")
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+
+def load_config() -> dict:
+    """Load config.json if present, falling back to defaults."""
+    cfg = {
+        "music_folder": DEFAULT_MUSIC_FOLDER,
+        "port": DEFAULT_PORT,
+        "threads": DEFAULT_THREADS,
+        "auto_start": True,
+    }
+    if os.path.isfile(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    cfg.update(data)
+        except Exception:
+            pass
+    return cfg
+
+
+def save_config(updates: dict) -> None:
+    """Save persistent configuration to config.json."""
+    try:
+        cur = load_config()
+        cur.update(updates)
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cur, f, indent=2)
+    except Exception:
+        pass
 
 # Worker threads = how many requests (e.g. audio streams) are served at the exact
 # same instant. Each active stream holds one thread until the player stops/seeks.
@@ -510,6 +567,22 @@ def _parse_year(raw) -> Optional[int]:
     return int(m.group()) if m else None
 
 
+def _added_time(st) -> int:
+    """"Date added to the folder" (unix seconds) for a file's stat result.
+
+    Copying music into a folder usually keeps the source's modification time, so
+    mtime does not reflect when the track landed here — the creation time does.
+    Prefer ``st_birthtime`` (Windows/macOS), fall back to Windows' ``st_ctime``
+    (also creation time there), then the modification time elsewhere.
+    """
+    bt = getattr(st, "st_birthtime", None)
+    if bt:
+        return int(bt)
+    if os.name == "nt":
+        return int(st.st_ctime)  # creation time on Windows
+    return int(st.st_mtime)
+
+
 def _parse_track_number(raw) -> Optional[int]:
     """Parse a 'tracknumber' tag (e.g. '3' or '3/12') into an int, else None."""
     if raw is None:
@@ -764,22 +837,31 @@ def log_scrobble(path, title, artist, album, duration):
 
 
 def get_stats():
-    """Aggregate the local play history into a small dashboard payload."""
+    """Aggregate the local play history into a dashboard payload.
+
+    Beyond the headline totals this now does a little analysis: top albums,
+    plays-per-day for the last two weeks, a 24-hour listening-clock histogram
+    and the first/last play timestamps — enough to see *when* and *what* you
+    listen to, not just how much."""
     out = {"totalPlays": 0, "totalSeconds": 0, "uniqueTracks": 0,
-           "topTracks": [], "topArtists": [], "recent": []}
+           "topTracks": [], "topArtists": [], "topAlbums": [], "recent": [],
+           "perDay": [], "byHour": [0] * 24, "firstPlay": None, "lastPlay": None}
     try:
         with _DB_LOCK, _db() as c:
             r = c.execute(
                 "SELECT COUNT(*) n, COALESCE(SUM(duration),0) s, "
-                "COUNT(DISTINCT path) u FROM scrobbles"
+                "COUNT(DISTINCT path) u, MIN(ts) mn, MAX(ts) mx FROM scrobbles"
             ).fetchone()
             out["totalPlays"] = r["n"] or 0
             out["totalSeconds"] = int(r["s"] or 0)
             out["uniqueTracks"] = r["u"] or 0
+            out["firstPlay"] = r["mn"]
+            out["lastPlay"] = r["mx"]
             out["topTracks"] = [
-                {"title": x["title"], "artist": x["artist"], "plays": x["plays"]}
+                {"title": x["title"], "artist": x["artist"],
+                 "path": x["path"], "plays": x["plays"]}
                 for x in c.execute(
-                    "SELECT title, artist, COUNT(*) plays FROM scrobbles "
+                    "SELECT title, artist, path, COUNT(*) plays FROM scrobbles "
                     "GROUP BY path ORDER BY plays DESC, MAX(ts) DESC LIMIT 20"
                 ).fetchall()
             ]
@@ -791,14 +873,61 @@ def get_stats():
                     "GROUP BY artist ORDER BY plays DESC LIMIT 20"
                 ).fetchall()
             ]
+            out["topAlbums"] = [
+                {"album": x["album"], "plays": x["plays"]}
+                for x in c.execute(
+                    "SELECT album, COUNT(*) plays FROM scrobbles "
+                    "WHERE album IS NOT NULL AND album <> '' "
+                    "GROUP BY album ORDER BY plays DESC LIMIT 20"
+                ).fetchall()
+            ]
             out["recent"] = [
                 {"title": x["title"], "artist": x["artist"], "ts": x["ts"]}
                 for x in c.execute(
                     "SELECT title, artist, ts FROM scrobbles ORDER BY ts DESC LIMIT 30"
                 ).fetchall()
             ]
+            # Plays per local calendar day for the last 14 days (fills gaps with 0).
+            by_day = {}
+            for x in c.execute(
+                "SELECT ts FROM scrobbles WHERE ts >= ?",
+                (time.time() - 14 * 86400,),
+            ).fetchall():
+                day = time.strftime("%Y-%m-%d", time.localtime(x["ts"]))
+                by_day[day] = by_day.get(day, 0) + 1
+            today = time.localtime()
+            base = time.mktime((today.tm_year, today.tm_mon, today.tm_mday,
+                                12, 0, 0, 0, 0, -1))
+            out["perDay"] = [
+                {"date": (d := time.strftime("%Y-%m-%d",
+                          time.localtime(base - i * 86400))), "plays": by_day.get(d, 0)}
+                for i in range(13, -1, -1)
+            ]
+            # Listening clock: plays bucketed by hour-of-day (local time), 0..23.
+            hours = [0] * 24
+            for x in c.execute("SELECT ts FROM scrobbles").fetchall():
+                hours[time.localtime(x["ts"]).tm_hour] += 1
+            out["byHour"] = hours
     except Exception as exc:
         print(f"  [stats] failed: {exc}", flush=True)
+    return out
+
+
+def get_play_counts():
+    """Return {relative_path: play_count} for every track with history.
+
+    Keyed by the same posix `path` each catalog entry carries, so the client
+    can show a per-song play tally without re-querying per row."""
+    out = {}
+    try:
+        with _DB_LOCK, _db() as c:
+            for x in c.execute(
+                "SELECT path, COUNT(*) n FROM scrobbles "
+                "WHERE path IS NOT NULL AND path <> '' GROUP BY path"
+            ).fetchall():
+                out[x["path"]] = x["n"]
+    except Exception as exc:
+        print(f"  [playcounts] failed: {exc}", flush=True)
     return out
 
 
@@ -1008,6 +1137,7 @@ class Song:
     track_number: Optional[int] = None
     actors: Optional[str] = None            # comma-separated; sidecar-only
     has_lyrics: bool = False                 # a .lrc/.txt sidecar exists
+    added_at: Optional[int] = None          # file mtime (unix secs) = date added
 
     def to_json(self, base_url: str) -> dict:
         """Serialize to the JSON shape the mobile client expects.
@@ -1037,6 +1167,8 @@ class Song:
             "duration": self.duration,
             "format": self.fmt,
             "sizeBytes": self.size_bytes,
+            # File mtime (unix seconds) = "date added", for the app's Date Added sort.
+            "addedAt": self.added_at,
             "artworkUrl": artwork_url,
             # Richer metadata for sorting / grouping in the Android app.
             "year": self.year,
@@ -1081,9 +1213,12 @@ class ServerState:
                 full_path = os.path.join(root, name)
                 rel_path = os.path.relpath(full_path, folder)
                 try:
-                    size = os.path.getsize(full_path)
+                    _st = os.stat(full_path)
+                    size = _st.st_size
+                    added_at = _added_time(_st)
                 except OSError:
                     size = 0
+                    added_at = None
 
                 # --- 1) current (filename / folder) defaults ------------------
                 # Keep " - " so lyrics lookup can split off a "Title - Artist" tail.
@@ -1155,6 +1290,7 @@ class ServerState:
                         actors=actors,
                         has_lyrics=(os.path.isfile(os.path.splitext(full_path)[0] + ".lrc")
                                     or os.path.isfile(os.path.splitext(full_path)[0] + ".txt")),
+                        added_at=added_at,
                     )
                 )
         with self._lock:
@@ -1847,6 +1983,11 @@ def create_app(state: ServerState) -> Flask:
     def stats():
         return jsonify(get_stats())
 
+    # -- Per-song play counts ({path: count}) -----------------------------
+    @app.route("/playcounts")
+    def playcounts():
+        return jsonify(get_play_counts())
+
     # -- Scrobble (record one play) ---------------------------------------
     @app.route("/scrobble", methods=["POST"])
     def scrobble():
@@ -1992,28 +2133,46 @@ class ServerGUI(ctk.CTk):
         self._wsgi_server = None          # waitress server instance when running
         self._server_thread: Optional[threading.Thread] = None
         self.host_ip = get_local_ip()
-        self.port = DEFAULT_PORT
-        self.threads = DEFAULT_THREADS
+
+        self.config = load_config()
+        self.port = int(self.config.get("port") or DEFAULT_PORT)
+        self.threads = int(self.config.get("threads") or DEFAULT_THREADS)
+
+        # System-tray state (notification area). The icon is created lazily the
+        # first time the window is hidden, then reused.
+        self._tray_icon = None
+        self._tray_thread: Optional[threading.Thread] = None
+        self._quitting = False
 
         # --- window ------------------------------------------------------
         self.title("AuraWave  —  Local Music Server")
-        self.geometry("980x680")
-        self.minsize(820, 560)
+        self.geometry("980x740")
+        self.minsize(820, 600)
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(2, weight=1)
+        self.grid_rowconfigure(3, weight=1)
 
         self._build_header()
         self._build_server_bar()
+        self._build_service_bar()
         self._build_devices_panel()
         self._build_log_panel()
 
-        # The server does NOT auto-start. Pick a music folder, then click
-        # "Start Server" — this avoids accidentally serving an empty library.
-        self.status_dot.configure(text_color="#e74c3c")
-        self.status_label.configure(text="Stopped")
-        self.srv_state.add_log("Select a music folder, then click Start Server.")
+        # Auto-load the default music folder (D:\songs)
+        initial_folder = self.config.get("music_folder") or DEFAULT_MUSIC_FOLDER
+        if initial_folder and os.path.isdir(initial_folder):
+            self.folder_label.configure(
+                text=f"📂  {initial_folder}      ·      Indexing tracks..."
+            )
+            self.srv_state.add_log(f"Auto-loading music folder: {initial_folder}")
+            threading.Thread(target=self._initial_scan, args=(initial_folder,), daemon=True).start()
+        else:
+            self.status_dot.configure(text_color="#e74c3c")
+            self.status_label.configure(text="Stopped")
+            self.srv_state.add_log("Select a music folder, then click Start Server.")
 
-        # Begin the periodic GUI refresh loop (devices table + log).
+        self._update_service_status()
+
+        # Begin the periodic GUI refresh loop (devices table + log + service).
         self.after(1000, self._refresh_loop)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -2235,9 +2394,45 @@ class ServerGUI(ctk.CTk):
         )
         self.dupes_btn.grid(row=0, column=10, padx=(8, 16), pady=12)
 
+    def _build_service_bar(self) -> None:
+        bar = ctk.CTkFrame(self, corner_radius=12)
+        bar.grid(row=2, column=0, padx=16, pady=4, sticky="ew")
+        bar.grid_columnconfigure(2, weight=1)
+
+        self.svc_dot = ctk.CTkLabel(bar, text="●", font=ctk.CTkFont(size=16), text_color="gray50")
+        self.svc_dot.grid(row=0, column=0, padx=(16, 4), pady=8)
+
+        self.svc_status_label = ctk.CTkLabel(
+            bar, text="Windows Service: Checking...", font=ctk.CTkFont(size=13, weight="bold")
+        )
+        self.svc_status_label.grid(row=0, column=1, padx=(0, 16), pady=8)
+
+        self.svc_boot_label = ctk.CTkLabel(
+            bar, text="Auto-Start on Boot: —", font=ctk.CTkFont(size=12), text_color=("gray40", "gray70"), anchor="w"
+        )
+        self.svc_boot_label.grid(row=0, column=2, padx=8, pady=8, sticky="w")
+
+        self.svc_install_btn = ctk.CTkButton(
+            bar, text="⚙ Install Service (Start on Boot)", width=220, fg_color="#1f6aa5",
+            hover_color="#144d77", command=self.action_install_service,
+        )
+        self.svc_install_btn.grid(row=0, column=3, padx=6, pady=8)
+
+        self.svc_toggle_btn = ctk.CTkButton(
+            bar, text="Start Service", width=110, fg_color="#1f8a4c",
+            hover_color="#176b3b", command=self.action_toggle_service,
+        )
+        self.svc_toggle_btn.grid(row=0, column=4, padx=6, pady=8)
+
+        self.svc_uninstall_btn = ctk.CTkButton(
+            bar, text="Uninstall", width=90, fg_color="gray30",
+            hover_color="gray25", command=self.action_uninstall_service,
+        )
+        self.svc_uninstall_btn.grid(row=0, column=5, padx=(6, 16), pady=8)
+
     def _build_devices_panel(self) -> None:
         panel = ctk.CTkFrame(self, corner_radius=12)
-        panel.grid(row=2, column=0, padx=16, pady=8, sticky="nsew")
+        panel.grid(row=3, column=0, padx=16, pady=8, sticky="nsew")
         panel.grid_columnconfigure(0, weight=1)
         panel.grid_rowconfigure(1, weight=1)
 
@@ -2306,7 +2501,7 @@ class ServerGUI(ctk.CTk):
 
     def _build_log_panel(self) -> None:
         frame = ctk.CTkFrame(self, corner_radius=12)
-        frame.grid(row=3, column=0, padx=16, pady=(8, 16), sticky="ew")
+        frame.grid(row=4, column=0, padx=16, pady=(8, 16), sticky="ew")
         frame.grid_columnconfigure(0, weight=1)
 
         header = ctk.CTkFrame(frame, fg_color="transparent")
@@ -2325,16 +2520,111 @@ class ServerGUI(ctk.CTk):
         self.log_box.configure(state="disabled")
 
     # -------------------------------------------------------------- actions
+    def _initial_scan(self, folder: str) -> None:
+        count = self.srv_state.scan_folder(folder)
+        self.after(0, lambda: self._on_initial_scan_done(folder, count))
+
+    def _on_initial_scan_done(self, folder: str, count: int) -> None:
+        self.folder_label.configure(
+            text=f"📂  {folder}      ·      {count} track(s) indexed"
+        )
+        self.srv_state.add_log(f"Indexed {count} track(s) from {folder}")
+        if self.config.get("auto_start", True) and self._wsgi_server is None:
+            svc = get_service_status() if SERVICE_MANAGER_AVAILABLE else {"running": False}
+            if not svc.get("running"):
+                self.start_server()
+
+    def _update_service_status(self) -> None:
+        if not hasattr(self, "svc_status_label") or not SERVICE_MANAGER_AVAILABLE:
+            return
+        try:
+            st = get_service_status()
+            if not st.get("installed"):
+                self.svc_dot.configure(text_color="gray50")
+                self.svc_status_label.configure(text="Windows Service: Not Installed")
+                self.svc_boot_label.configure(text="Auto-Start on Boot: Disabled")
+                self.svc_install_btn.configure(state="normal", text="⚙ Install Service (Start on Boot)")
+                self.svc_toggle_btn.configure(state="disabled", text="Start Service")
+                self.svc_uninstall_btn.configure(state="disabled")
+            elif st.get("running"):
+                self.svc_dot.configure(text_color="#2ecc71")
+                self.svc_status_label.configure(text="Windows Service: Running")
+                boot_txt = "Enabled (Automatic)" if st.get("start_type") == "AUTOMATIC" else "Manual"
+                self.svc_boot_label.configure(text=f"Auto-Start on Boot: {boot_txt}")
+                self.svc_install_btn.configure(state="disabled", text="Installed (Auto-Boot)")
+                self.svc_toggle_btn.configure(state="normal", text="Stop Service", fg_color="#c0392b", hover_color="#962d22")
+                self.svc_uninstall_btn.configure(state="normal")
+
+                if self._wsgi_server is None:
+                    self.status_dot.configure(text_color="#2ecc71")
+                    self.status_label.configure(text="Running (Service)")
+                    url = f"http://{self.host_ip}:{self.port}"
+                    self.url_label.configure(text=f"Server URL:  {url}   (Windows Service Active)")
+                    self.toggle_btn.configure(text="Stop Service")
+            else:
+                self.svc_dot.configure(text_color="#e67e22")
+                self.svc_status_label.configure(text=f"Windows Service: {str(st.get('status')).capitalize()}")
+                boot_txt = "Enabled (Automatic)" if st.get("start_type") == "AUTOMATIC" else "Manual"
+                self.svc_boot_label.configure(text=f"Auto-Start on Boot: {boot_txt}")
+                self.svc_install_btn.configure(state="disabled", text="Installed (Auto-Boot)")
+                self.svc_toggle_btn.configure(state="normal", text="Start Service", fg_color="#1f8a4c", hover_color="#176b3b")
+                self.svc_uninstall_btn.configure(state="normal")
+                if self._wsgi_server is None:
+                    self.status_dot.configure(text_color="#e74c3c")
+                    self.status_label.configure(text="Stopped")
+                    self.toggle_btn.configure(text="Start Server")
+        except Exception:
+            pass
+
+    def action_install_service(self) -> None:
+        folder = self.srv_state.music_folder or DEFAULT_MUSIC_FOLDER
+        self.srv_state.add_log("Installing Windows Service (Auto-Start on Boot)...")
+        def worker():
+            ok, msg = install_service(folder, self.port)
+            self.after(0, lambda: self._on_service_action_result("Install", ok, msg))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def action_toggle_service(self) -> None:
+        st = get_service_status() if SERVICE_MANAGER_AVAILABLE else {"running": False}
+        if st.get("running"):
+            self.srv_state.add_log("Stopping Windows Service...")
+            def worker():
+                ok, msg = svc_stop()
+                self.after(0, lambda: self._on_service_action_result("Stop", ok, msg))
+            threading.Thread(target=worker, daemon=True).start()
+        else:
+            self.srv_state.add_log("Starting Windows Service...")
+            def worker():
+                ok, msg = svc_start()
+                self.after(0, lambda: self._on_service_action_result("Start", ok, msg))
+            threading.Thread(target=worker, daemon=True).start()
+
+    def action_uninstall_service(self) -> None:
+        self.srv_state.add_log("Uninstalling Windows Service...")
+        def worker():
+            ok, msg = uninstall_service()
+            self.after(0, lambda: self._on_service_action_result("Uninstall", ok, msg))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_service_action_result(self, action: str, ok: bool, msg: str) -> None:
+        self.srv_state.add_log(f"Service {action}: {'Success' if ok else 'Failed'} - {msg}")
+        self._update_service_status()
+
     def select_folder(self) -> None:
         folder = filedialog.askdirectory(title="Select your music folder")
         if not folder:
             return
         count = self.srv_state.scan_folder(folder)
+        save_config({"music_folder": folder})
         self.folder_label.configure(
             text=f"📂  {folder}      ·      {count} track(s) indexed"
         )
         self.srv_state.add_log(f"Indexed {count} track(s) from {folder}")
-        if self._wsgi_server is None:
+        if SERVICE_MANAGER_AVAILABLE:
+            st = get_service_status()
+            if st.get("running"):
+                self.srv_state.add_log("Note: Windows Service is running. Restart service to apply folder changes.")
+        elif self._wsgi_server is None:
             self.srv_state.add_log("Folder ready — click Start Server to go live.")
 
     def rescan(self) -> None:
@@ -2591,6 +2881,20 @@ class ServerGUI(ctk.CTk):
             self.srv_state.add_log("Invalid 'Max streams' — enter a value between 1 and 256.")
             return
 
+        save_config({"port": self.port, "threads": self.threads})
+
+        if SERVICE_MANAGER_AVAILABLE:
+            svc = get_service_status()
+            if svc.get("running"):
+                url = f"http://{self.host_ip}:{self.port}"
+                self.status_dot.configure(text_color="#2ecc71")
+                self.status_label.configure(text="Running (Service)")
+                self.url_label.configure(text=f"Server URL:  {url}   (Windows Service Active)")
+                self.toggle_btn.configure(text="Stop Service")
+                self.srv_state.add_log(f"Server is active via Windows Service at {url}")
+                self._update_tray()
+                return
+
         try:
             # create_server binds immediately (so port errors surface now),
             # then we run its loop on a daemon thread.
@@ -2621,6 +2925,7 @@ class ServerGUI(ctk.CTk):
         self.status_label.configure(text="Running")
         self.url_label.configure(text=f"Server URL:  {url}   (enter this in the Android app)")
         self.toggle_btn.configure(text="Stop Server")
+        self._update_tray()
         self.srv_state.add_log(
             f"Server started at {url} (up to {self.threads} simultaneous streams)"
         )
@@ -2638,9 +2943,15 @@ class ServerGUI(ctk.CTk):
         self.status_label.configure(text="Stopped")
         self.url_label.configure(text="Server URL: —")
         self.toggle_btn.configure(text="Start Server")
+        self._update_tray()
         self.srv_state.add_log("Server stopped.")
 
     def toggle_server(self) -> None:
+        if SERVICE_MANAGER_AVAILABLE:
+            st = get_service_status()
+            if st.get("running"):
+                self.action_toggle_service()
+                return
         if self._wsgi_server is None:
             self.start_server()
         else:
@@ -2652,6 +2963,11 @@ class ServerGUI(ctk.CTk):
         self._refresh_devices()
         self._refresh_log()
         self._refresh_ai_batch()
+        if not hasattr(self, "_refresh_tick"):
+            self._refresh_tick = 0
+        self._refresh_tick += 1
+        if self._refresh_tick % 2 == 0:
+            self._update_service_status()
         self.after(1000, self._refresh_loop)
 
     def _refresh_devices(self) -> None:
@@ -2696,6 +3012,142 @@ class ServerGUI(ctk.CTk):
 
     # -------------------------------------------------------------- closing
     def _on_close(self) -> None:
+        """Closing the window hides it to the system tray instead of quitting, so
+        the server keeps running in the background. Use the tray menu's Quit (or
+        the case where the tray is unavailable) to actually exit."""
+        if self._quitting:
+            self._real_quit()
+            return
+        self._hide_to_tray()
+
+    # ------------------------------------------------------------- system tray
+    def _make_tray_image(self):
+        """Draw a simple AuraWave tray icon (green disc + white music note)."""
+        size = 64
+        img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        d.ellipse((3, 3, size - 3, size - 3), fill=(30, 215, 96, 255))  # brand green
+        # A minimalist musical note in white.
+        d.ellipse((24, 40, 38, 52), fill=(255, 255, 255, 255))         # note head
+        d.rectangle((35, 16, 39, 46), fill=(255, 255, 255, 255))       # stem
+        d.polygon([(39, 16), (50, 20), (39, 28)], fill=(255, 255, 255, 255))  # flag
+        return img
+
+    def _build_tray_menu(self):
+        """The tray right-click menu. Text for the status/toggle items is supplied
+        by callables so it always reflects the live server state."""
+        return pystray.Menu(
+            pystray.MenuItem(self._tray_status_text, None, enabled=False),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Open window", self._tray_show, default=True),
+            pystray.MenuItem(self._tray_toggle_text, self._tray_toggle),
+            pystray.MenuItem("Copy server URL", self._tray_copy_url),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Quit", self._tray_quit),
+        )
+
+    def _tray_status_text(self, _item=None) -> str:
+        if self._wsgi_server is not None:
+            return f"AuraWave — Running :{self.port}"
+        return "AuraWave — Stopped"
+
+    def _tray_toggle_text(self, _item=None) -> str:
+        return "Stop server" if self._wsgi_server is not None else "Start server"
+
+    def _ensure_tray(self) -> bool:
+        """Create + start the tray icon once; return True if the tray is available."""
+        if not TRAY_AVAILABLE:
+            return False
+        if self._tray_icon is not None:
+            return True
+        try:
+            self._tray_icon = pystray.Icon(
+                "aurawave",
+                self._make_tray_image(),
+                "AuraWave Music Server",
+                menu=self._build_tray_menu(),
+            )
+            # pystray runs its own event loop; keep it off the Tk main thread.
+            self._tray_thread = threading.Thread(
+                target=self._tray_icon.run, daemon=True, name="tray"
+            )
+            self._tray_thread.start()
+            return True
+        except Exception as exc:  # pragma: no cover - platform dependent
+            self.srv_state.add_log(f"System tray unavailable: {exc}")
+            self._tray_icon = None
+            return False
+
+    def _hide_to_tray(self) -> None:
+        if self._ensure_tray():
+            self.withdraw()  # remove from taskbar; icon lives in the tray
+            self._update_tray()
+            self.srv_state.add_log("Minimized to the system tray (right-click the icon for options).")
+        else:
+            # No tray support -> preserve the original close-to-quit behavior.
+            self._real_quit()
+
+    def _update_tray(self) -> None:
+        """Refresh the tray menu text after the server state changes."""
+        if self._tray_icon is not None:
+            try:
+                self._tray_icon.update_menu()
+            except Exception:
+                pass
+
+    # Tray callbacks fire on pystray's thread; marshal everything that touches Tk
+    # back onto the GUI thread via `after`.
+    def _tray_show(self, _icon=None, _item=None) -> None:
+        self.after(0, self._show_window)
+
+    def _show_window(self) -> None:
+        try:
+            self.deiconify()
+            self.state("normal")
+            self.lift()
+            self.focus_force()
+        except Exception:
+            pass
+
+    def _tray_toggle(self, _icon=None, _item=None) -> None:
+        self.after(0, self._toggle_from_tray)
+
+    def _toggle_from_tray(self) -> None:
+        self.toggle_server()
+        self._update_tray()
+
+    def _tray_copy_url(self, _icon=None, _item=None) -> None:
+        self.after(0, self._copy_url_to_clipboard)
+
+    def _copy_url_to_clipboard(self) -> None:
+        if self._wsgi_server is None:
+            self.srv_state.add_log("Server not running — start it first to get a URL.")
+            return
+        url = f"http://{self.host_ip}:{self.port}"
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(url)
+            self.srv_state.add_log(f"Copied server URL to clipboard: {url}")
+        except Exception:
+            pass
+
+    def _tray_quit(self, _icon=None, _item=None) -> None:
+        # Stop the tray loop on its own thread, then quit Tk on the main thread.
+        try:
+            if self._tray_icon is not None:
+                self._tray_icon.stop()
+        except Exception:
+            pass
+        self._tray_icon = None
+        self.after(0, self._real_quit)
+
+    def _real_quit(self) -> None:
+        self._quitting = True
+        try:
+            if self._tray_icon is not None:
+                self._tray_icon.stop()
+        except Exception:
+            pass
         self.stop_server()
         self.destroy()
 
@@ -2706,4 +3158,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if "--headless" in sys.argv or "--service" in sys.argv:
+        from service_runner import main as service_main
+        service_main()
+    else:
+        main()

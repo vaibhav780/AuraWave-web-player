@@ -110,13 +110,13 @@
   const SORTS = [
     ["TITLE", "Title"], ["ARTIST", "Artist"], ["ALBUM_ARTIST", "Album Artist"],
     ["ALBUM", "Album"], ["YEAR", "Release Year"], ["MUSIC_DIRECTOR", "Music Director"],
-    ["DURATION", "Duration"],
+    ["DURATION", "Duration"], ["DATE_ADDED", "Date Added"],
   ];
   const GROUPS = [
     ["NONE", "None"], ["ALBUM", "Album"], ["ARTIST", "Artist"], ["ALBUM_ARTIST", "Album Artist"],
     ["YEAR", "Release Year"], ["MUSIC_DIRECTOR", "Music Director"],
   ];
-  const REVERBS = ["OFF", "ROOM", "HALL", "STADIUM"];
+  const REVERBS = ["OFF", "ROOM", "HALL", "STADIUM", "CATHEDRAL", "PLATE", "CAVE"];
   // JetAudio-style genre presets: a 5-point template (low->high), remapped to 10 bands.
   const GENRE_PRESETS = {
     Flat: [0, 0, 0, 0, 0],
@@ -166,6 +166,7 @@
     playlists: ls.get("playlists", []),
     searchHistory: ls.get("searchHistory", []),
     caps: { canEditTags: false, fts: false, watch: false, aiInstrumental: false, stemMixer: false }, // filled from GET /capabilities
+    playCounts: {},             // { relativePath: playCount } from GET /playcounts (server-tracked)
     eq: ls.get("eq", {
       enabled: true,
       preset: "Flat",
@@ -187,6 +188,19 @@
       surround3d: 0,     // 3D virtual surround (HRTF) amount, 0..100
       eqMode: "graphic", // "graphic" (10-band presets) | "parametric"
       eqParam: null,     // parametric bands: [{type,freq,gain,q}] (lazily defaulted)
+      clarity: 0,        // 0..100 Treble Crystalizer (exciter)
+      vocalBoost: 0,     // 0..100 Vocal / Dialogue Clarity Booster (2.8 kHz)
+      subBass: 0,        // 0..100 Sub-bass Resonator (45 Hz deep punch)
+      deEsser: 0,        // 0..100 De-Esser (6.5 kHz sibilance reducer)
+      warmth: 0,         // 0..100 Analog / Tape Warmth (soft saturation + vintage roll-off)
+      echo: 0,           // 0..100 Ping-Pong Delay / Stereo Echo wet mix
+      echoTime: 350,     // 100..800 ms Delay Time
+      orbit8d: 0,        // 0..100 8D Audio Binaural Orbit (0 = off, 1..100 speed)
+      chorus: 0,         // 0..100 Stereo Chorus shimmer
+      balance: 0,        // -100 (Left) .. 0 (Center) .. +100 (Right)
+      mono: false,       // Mono Downmix
+      nightMode: false,  // Late-Night Dynamic Compression
+      loudnessComp: false, // Fletcher-Munson dynamic loudness compensation
     }),
   };
   // Back-fill new eq keys for users with an older persisted object.
@@ -200,6 +214,19 @@
   delete state.eq.aiInstrumental;
   if (state.eq.limiter == null) state.eq.limiter = true;
   if (state.eq.surround3d == null) state.eq.surround3d = 0;
+  if (state.eq.clarity == null) state.eq.clarity = 0;
+  if (state.eq.vocalBoost == null) state.eq.vocalBoost = 0;
+  if (state.eq.subBass == null) state.eq.subBass = 0;
+  if (state.eq.deEsser == null) state.eq.deEsser = 0;
+  if (state.eq.warmth == null) state.eq.warmth = 0;
+  if (state.eq.echo == null) state.eq.echo = 0;
+  if (state.eq.echoTime == null) state.eq.echoTime = 350;
+  if (state.eq.orbit8d == null) state.eq.orbit8d = 0;
+  if (state.eq.chorus == null) state.eq.chorus = 0;
+  if (state.eq.balance == null) state.eq.balance = 0;
+  if (state.eq.mono == null) state.eq.mono = false;
+  if (state.eq.nightMode == null) state.eq.nightMode = false;
+  if (state.eq.loudnessComp == null) state.eq.loudnessComp = false;
   // Stem-mixer settings (separate ls key; its own enable + per-stem volumes).
   state.stems = ls.get("stems", { on: false, v: 0, d: 100, b: 100, o: 100 });
   // User-saved custom EQ presets: [{name, gains:[10]}].
@@ -238,6 +265,64 @@
   let brickLimiter = null;                   // safety limiter on the final stage
   let hrtfWet = null;                        // 3D virtual-surround (HRTF) wet mix
   let bypassAll = false;                     // A/B compare: bypass all tonal/spatial effects
+
+  // Extended audio effect nodes
+  let subBassNode = null;                    // 45Hz sub-bass punch
+  let vocalBoostNode = null;                 // 2.8kHz vocal clarity booster
+  let deEsserNode = null;                    // 6.5kHz sibilance tamer
+  let clarityNode = null;                    // 9.5kHz treble exciter
+  let lofiDryGain = null, lofiWetGain = null, lofiShaper = null, lofiLp = null, lofiHp = null;
+  let echoDelayL = null, echoDelayR = null, echoFbL = null, echoFbR = null, echoWet = null;
+  let chorusDelayL = null, chorusDelayR = null, chorusWet = null;
+  let orbitPanner = null, orbitWet = null, orbitRaf = null, orbitAngle = 0, orbitLastTime = 0;
+  let panNode = null;
+  let monoDirectL = null, monoDirectR = null, monoCrossL = null, monoCrossR = null;
+
+  /** Create a soft-saturation sigmoid curve for analog/tape warmth. */
+  function makeWarmthCurve(amount) {
+    const n = 4096;
+    const curve = new Float32Array(n);
+    const k = 1 + Math.max(0.01, amount) * 3;
+    const denom = Math.tanh(k);
+    for (let i = 0; i < n; i++) {
+      const x = (i * 2) / n - 1;
+      curve[i] = Math.tanh(k * x) / denom;
+    }
+    return curve;
+  }
+
+  /** Animate 8D Audio binaural orbit in real time when music is playing. */
+  function tickOrbit(ts) {
+    if (!orbitLastTime) orbitLastTime = ts;
+    const dt = (ts - orbitLastTime) / 1000;
+    orbitLastTime = ts;
+    if (state.eq.orbit8d > 0 && !bypassAll && orbitPanner) {
+      const speed = 0.25 + (state.eq.orbit8d / 100) * 1.35;
+      orbitAngle = (orbitAngle + speed * dt) % (Math.PI * 2);
+      const radius = 2.0;
+      const x = Math.sin(orbitAngle) * radius;
+      const z = Math.cos(orbitAngle) * radius;
+      setPannerPos(orbitPanner, x, 0, z);
+    }
+    const isPlaying = !act().paused;
+    if (isPlaying && state.eq.orbit8d > 0 && !bypassAll) {
+      orbitRaf = requestAnimationFrame(tickOrbit);
+    } else {
+      orbitRaf = null;
+      orbitLastTime = 0;
+    }
+  }
+
+  function checkOrbitLoop() {
+    const isPlaying = !act().paused;
+    if (isPlaying && state.eq.orbit8d > 0 && !bypassAll) {
+      if (!orbitRaf) orbitRaf = requestAnimationFrame(tickOrbit);
+    } else if (orbitRaf) {
+      cancelAnimationFrame(orbitRaf);
+      orbitRaf = null;
+      orbitLastTime = 0;
+    }
+  }
 
   /** Position a PannerNode, tolerating old (setPosition) and new (AudioParam) APIs. */
   function setPannerPos(p, x, y, z) {
@@ -280,6 +365,32 @@
       const bass = ctx.createBiquadFilter();
       bass.type = "lowshelf"; bass.frequency.value = 110; bass.gain.value = 0;
 
+      // Sub-Bass: 45 Hz deep resonator
+      const subB = ctx.createBiquadFilter();
+      subB.type = "peaking"; subB.frequency.value = 45; subB.Q.value = 1.4; subB.gain.value = 0;
+
+      // Vocal clarity booster: 2.8 kHz presence
+      const vBoost = ctx.createBiquadFilter();
+      vBoost.type = "peaking"; vBoost.frequency.value = 2800; vBoost.Q.value = 1.2; vBoost.gain.value = 0;
+
+      // De-Esser: 6.5 kHz sibilance tamer
+      const deEss = ctx.createBiquadFilter();
+      deEss.type = "peaking"; deEss.frequency.value = 6500; deEss.Q.value = 2.0; deEss.gain.value = 0;
+
+      // Treble clarity / exciter: 9.5 kHz high shelf
+      const clr = ctx.createBiquadFilter();
+      clr.type = "highshelf"; clr.frequency.value = 9500; clr.gain.value = 0;
+
+      // Lo-Fi / Analog Warmth stage
+      const lfDry = ctx.createGain(); lfDry.gain.value = 1;
+      const lfWet = ctx.createGain(); lfWet.gain.value = 0;
+      const lfShaper = ctx.createWaveShaper();
+      try { lfShaper.oversample = "2x"; } catch {}
+      lfShaper.curve = makeWarmthCurve(0);
+      const lfLp = ctx.createBiquadFilter(); lfLp.type = "lowpass"; lfLp.frequency.value = 20000;
+      const lfHp = ctx.createBiquadFilter(); lfHp.type = "highpass"; lfHp.frequency.value = 20;
+      const lfOut = ctx.createGain();
+
       // --- Vocal removal (centre-channel cancellation) -------------------
       // Classic "karaoke" matrix: outL = L - s·R, outR = R - s·L. Content panned
       // dead-centre (usually the lead vocal) is equal in both channels, so the
@@ -297,17 +408,25 @@
       vLL.connect(vrMerge, 0, 0); vRL.connect(vrMerge, 0, 0); // -> left
       vLR.connect(vrMerge, 0, 1); vRR.connect(vrMerge, 0, 1); // -> right
 
-      // Chain input (both decks) -> vocal-removal matrix -> eq... -> xbass
+      // Chain input (both decks) -> vocal-removal matrix -> eq... -> subBass -> xbass -> vocalBoost -> deEsser -> clarity -> lofi
       let prev = vrMerge;
       for (const n of eq) { prev.connect(n); prev = n; }
-      prev.connect(bass);
+      prev.connect(subB);
+      subB.connect(bass);
+      bass.connect(vBoost);
+      vBoost.connect(deEss);
+      deEss.connect(clr);
+
+      // Lo-Fi parallel dry/wet
+      clr.connect(lfDry).connect(lfOut);
+      clr.connect(lfShaper).connect(lfHp).connect(lfLp).connect(lfWet).connect(lfOut);
 
       // --- Stereo-widen mid/side matrix ----------------------------------
       // outL = 0.5(1+w)L + 0.5(1-w)R ; outR = 0.5(1-w)L + 0.5(1+w)R
       const splitter = ctx.createChannelSplitter(2);
       const merger = ctx.createChannelMerger(2);
       const gLL = ctx.createGain(), gRL = ctx.createGain(), gLR = ctx.createGain(), gRR = ctx.createGain();
-      bass.connect(splitter);
+      lfOut.connect(splitter);
       splitter.connect(gLL, 0); splitter.connect(gLR, 0); // L
       splitter.connect(gRL, 1); splitter.connect(gRR, 1); // R
       gLL.connect(merger, 0, 0); gRL.connect(merger, 0, 0); // -> left
@@ -339,11 +458,46 @@
       wdL.connect(wMerge, 0, 1); wdR.connect(wMerge, 0, 0); // swap channels
       wMerge.connect(wWet);
 
+      // --- Ping-Pong Delay / Stereo Echo ---------------------------------
+      const eSplit = ctx.createChannelSplitter(2), eMerge = ctx.createChannelMerger(2);
+      const eDelayL = ctx.createDelay(1.5), eDelayR = ctx.createDelay(1.5);
+      eDelayL.delayTime.value = 0.35; eDelayR.delayTime.value = 0.26;
+      const eFbL = ctx.createGain(); eFbL.gain.value = 0;
+      const eFbR = ctx.createGain(); eFbR.gain.value = 0;
+      const eFiltL = ctx.createBiquadFilter(); eFiltL.type = "lowpass"; eFiltL.frequency.value = 3500;
+      const eFiltR = ctx.createBiquadFilter(); eFiltR.type = "lowpass"; eFiltR.frequency.value = 3500;
+      const eWet = ctx.createGain(); eWet.gain.value = 0;
+      merger.connect(eSplit);
+      eSplit.connect(eDelayL, 0); eSplit.connect(eDelayR, 1);
+      eDelayL.connect(eFiltL).connect(eFbL).connect(eDelayR);
+      eDelayR.connect(eFiltR).connect(eFbR).connect(eDelayL);
+      eDelayL.connect(eMerge, 0, 0); eDelayR.connect(eMerge, 0, 1);
+      eMerge.connect(eWet);
+
+      // --- Stereo Chorus -------------------------------------------------
+      const cSplit = ctx.createChannelSplitter(2), cMerge = ctx.createChannelMerger(2);
+      const cDelayL = ctx.createDelay(0.1), cDelayR = ctx.createDelay(0.1);
+      cDelayL.delayTime.value = 0.018; cDelayR.delayTime.value = 0.025;
+      const cWet = ctx.createGain(); cWet.gain.value = 0;
+      const cOsc1 = ctx.createOscillator(); cOsc1.type = "sine"; cOsc1.frequency.value = 1.1;
+      const cOscGain1 = ctx.createGain(); cOscGain1.gain.value = 0.0025;
+      cOsc1.connect(cOscGain1); cOscGain1.connect(cDelayL.delayTime);
+      const cOsc2 = ctx.createOscillator(); cOsc2.type = "sine"; cOsc2.frequency.value = 0.85;
+      const cOscGain2 = ctx.createGain(); cOscGain2.gain.value = 0.003;
+      cOsc2.connect(cOscGain2); cOscGain2.connect(cDelayR.delayTime);
+      try { cOsc1.start(); cOsc2.start(); } catch {}
+      merger.connect(cSplit);
+      cSplit.connect(cDelayL, 0); cSplit.connect(cDelayR, 1);
+      cDelayL.connect(cMerge, 0, 0); cDelayR.connect(cMerge, 0, 1);
+      cMerge.connect(cWet);
+
       const master = ctx.createGain();
       merger.connect(dry).connect(master);
       merger.connect(conv).connect(rWet).connect(master);
       sWet.connect(master);
       wWet.connect(master);
+      eWet.connect(master);
+      cWet.connect(master);
 
       // --- Headphone crossfeed (BS2B-style) ------------------------------
       // Blend a little of each channel into the other, short-delayed + low-passed,
@@ -368,7 +522,7 @@
       cfXR.connect(cfMerge, 0, 0);  // right source -> left channel
       cfMerge.connect(cfOut);
 
-      // --- 3D virtual surround (HRTF) ------------------------------------
+      // --- 3D virtual surround (HRTF static front) ------------------------
       // Externalise the sound on headphones by placing two virtual front
       // speakers (±) around the listener via HRTF panners. Wet level is driven
       // from applyEffects(); 0 = bypassed. Summed into the crossfeed output bus.
@@ -384,13 +538,46 @@
       pannerL.connect(hWet); pannerR.connect(hWet);
       hWet.connect(cfOut);
 
-      // Loudness normalization: a compressor + makeup gain that evens out levels
-      // between tracks. Transparent (ratio 1) when disabled.
+      // --- 8D Audio (HRTF dynamic 360-degree orbit) -----------------------
+      const p8d = ctx.createPanner();
+      p8d.panningModel = "HRTF";
+      p8d.distanceModel = "inverse";
+      setPannerPos(p8d, 0, 0, 1.8);
+      const o8Wet = ctx.createGain(); o8Wet.gain.value = 0;
+      master.connect(p8d).connect(o8Wet).connect(cfOut);
+
+      // --- Mono downmix matrix -------------------------------------------
+      const mSplit = ctx.createChannelSplitter(2);
+      const mMerge = ctx.createChannelMerger(2);
+      const mDirL = ctx.createGain(); mDirL.gain.value = 1;
+      const mDirR = ctx.createGain(); mDirR.gain.value = 1;
+      const mCrossL = ctx.createGain(); mCrossL.gain.value = 0;
+      const mCrossR = ctx.createGain(); mCrossR.gain.value = 0;
+
+      cfOut.connect(mSplit);
+      mSplit.connect(mDirL, 0);   mSplit.connect(mCrossR, 0);
+      mSplit.connect(mCrossL, 1); mSplit.connect(mDirR, 1);
+      mDirL.connect(mMerge, 0, 0); mCrossL.connect(mMerge, 0, 0);
+      mCrossR.connect(mMerge, 0, 1); mDirR.connect(mMerge, 0, 1);
+
+      // --- Stereo Balance ------------------------------------------------
+      let pNode = null;
+      let preComp = mMerge;
+      if (ctx.createStereoPanner) {
+        try {
+          pNode = ctx.createStereoPanner();
+          pNode.pan.value = 0;
+          mMerge.connect(pNode);
+          preComp = pNode;
+        } catch {}
+      }
+
+      // Loudness normalization & Night mode compressor
       const comp = ctx.createDynamicsCompressor();
       const makeup = ctx.createGain(); makeup.gain.value = 1;
       // Safety limiter: catches peaks from EQ/bass boosts so nothing clips.
       const limiter = ctx.createDynamicsCompressor();
-      cfOut.connect(comp).connect(makeup).connect(limiter).connect(ctx.destination);
+      preComp.connect(comp).connect(makeup).connect(limiter).connect(ctx.destination);
 
       // Analyser tap for the visualizer (reads the post-effects signal).
       const an = ctx.createAnalyser();
@@ -400,6 +587,13 @@
 
       // Commit to module-level refs only now that the whole graph succeeded.
       ac = ctx; srcNode = src; eqNodes = eq; xbass = bass;
+      subBassNode = subB; vocalBoostNode = vBoost; deEsserNode = deEss; clarityNode = clr;
+      lofiDryGain = lfDry; lofiWetGain = lfWet; lofiShaper = lfShaper; lofiLp = lfLp; lofiHp = lfHp;
+      echoDelayL = eDelayL; echoDelayR = eDelayR; echoFbL = eFbL; echoFbR = eFbR; echoWet = eWet;
+      chorusDelayL = cDelayL; chorusDelayR = cDelayR; chorusWet = cWet;
+      orbitPanner = p8d; orbitWet = o8Wet;
+      monoDirectL = mDirL; monoDirectR = mDirR; monoCrossL = mCrossL; monoCrossR = mCrossR;
+      panNode = pNode;
       widenGLL = gLL; widenGRL = gRL; widenGLR = gLR; widenGRR = gRR;
       dryGain = dry; reverbConv = conv; reverbWet = rWet;
       surroundWet = sWet; widenWet = wWet;
@@ -438,6 +632,9 @@
     ROOM: { sec: 0.7, decay: 2.6, wet: 0.55, dry: 0.9 },
     HALL: { sec: 2.0, decay: 2.2, wet: 0.85, dry: 0.8 },
     STADIUM: { sec: 3.6, decay: 1.7, wet: 1.15, dry: 0.7 },
+    CATHEDRAL: { sec: 4.5, decay: 1.4, wet: 1.25, dry: 0.65 },
+    PLATE: { sec: 1.4, decay: 3.2, wet: 0.75, dry: 0.85 },
+    CAVE: { sec: 2.8, decay: 1.9, wet: 1.0, dry: 0.7 },
   };
   let reverbCache = {};
 
@@ -480,6 +677,52 @@
       });
     }
 
+    // Sub-bass resonator (45 Hz deep punch)
+    if (subBassNode) {
+      let sbGain = (e.subBass / 100) * 10;
+      if (e.loudnessComp && !bypassAll) {
+        const vDef = Math.max(0, (80 - (e.volume || 100)) / 80);
+        sbGain += vDef * 5;
+      }
+      subBassNode.gain.value = sbGain;
+    }
+
+    // X-Bass: 0..100 -> 0..12 dB low-shelf.
+    xbass.gain.value = (e.bass / 100) * 12;
+
+    // Vocal clarity booster: 0..100 -> 0..8 dB peaking boost at 2.8kHz
+    if (vocalBoostNode) vocalBoostNode.gain.value = (e.vocalBoost / 100) * 8;
+
+    // De-Esser: 0..100 -> 0..-9 dB peaking cut at 6.5kHz
+    if (deEsserNode) deEsserNode.gain.value = -((e.deEsser / 100) * 9);
+
+    // Treble clarity / exciter: 0..100 -> 0..10 dB high-shelf at 9.5kHz
+    if (clarityNode) {
+      let clGain = (e.clarity / 100) * 10;
+      if (e.loudnessComp && !bypassAll) {
+        const vDef = Math.max(0, (80 - (e.volume || 100)) / 80);
+        clGain += vDef * 4;
+      }
+      clarityNode.gain.value = clGain;
+    }
+
+    // Lo-Fi / Analog Warmth
+    if (lofiDryGain && lofiWetGain) {
+      const w = (e.warmth || 0) / 100;
+      if (w > 0) {
+        lofiDryGain.gain.value = 1 - w * 0.45;
+        lofiWetGain.gain.value = w * 0.85;
+        lofiLp.frequency.value = 19000 - w * 12000;
+        lofiHp.frequency.value = 20 + w * 110;
+        lofiShaper.curve = makeWarmthCurve(w);
+      } else {
+        lofiDryGain.gain.value = 1;
+        lofiWetGain.gain.value = 0;
+        lofiLp.frequency.value = 20000;
+        lofiHp.frequency.value = 20;
+      }
+    }
+
     // Headphone crossfeed: 0..100 -> 0..~0.5 cross-channel wet level.
     if (cfCrossL && cfCrossR) {
       const cf = (e.crossfeed || 0) / 100 * 0.5;
@@ -496,9 +739,6 @@
       vrRtoL.gain.value = -s;
       vrLtoR.gain.value = -s;
     }
-
-    // X-Bass: 0..100 -> 0..12 dB low-shelf.
-    xbass.gain.value = (e.bass / 100) * 12;
 
     // Stereo widen: M/S matrix (widens true-stereo content) up to width 3,
     // plus a Haas cross-delay wet (so widening is audible on mono/centred audio).
@@ -525,9 +765,55 @@
     // X-Surround wet level.
     surroundWet.gain.value = (e.surround / 100) * 0.9;
 
-    // Loudness normalization: compress + makeup when on, transparent when off.
+    // Ping-Pong Echo / Delay
+    if (echoWet) {
+      const ew = (e.echo || 0) / 100;
+      echoWet.gain.value = ew * 0.65;
+      const t = Math.max(0.1, Math.min(0.8, (e.echoTime || 350) / 1000));
+      echoDelayL.delayTime.value = t;
+      echoDelayR.delayTime.value = t * 0.75;
+      const fb = ew > 0 ? 0.36 : 0;
+      echoFbL.gain.value = fb;
+      echoFbR.gain.value = fb;
+    }
+
+    // Stereo Chorus
+    if (chorusWet) {
+      chorusWet.gain.value = ((e.chorus || 0) / 100) * 0.7;
+    }
+
+    // 8D Audio
+    if (orbitWet) {
+      orbitWet.gain.value = e.orbit8d > 0 ? 1.0 : 0;
+    }
+    checkOrbitLoop();
+
+    // 3D virtual surround (HRTF): 0..100 -> 0..~1.2 wet level.
+    if (hrtfWet) hrtfWet.gain.value = (e.surround3d || 0) / 100 * 1.2;
+
+    // Mono Downmix
+    if (monoDirectL && monoCrossL) {
+      if (e.mono) {
+        monoDirectL.gain.value = 0.5; monoDirectR.gain.value = 0.5;
+        monoCrossL.gain.value = 0.5;  monoCrossR.gain.value = 0.5;
+      } else {
+        monoDirectL.gain.value = 1; monoDirectR.gain.value = 1;
+        monoCrossL.gain.value = 0;  monoCrossR.gain.value = 0;
+      }
+    }
+
+    // Stereo Balance
+    if (panNode) {
+      panNode.pan.value = Math.max(-1, Math.min(1, (e.balance || 0) / 100));
+    }
+
+    // Dynamics Compressor (Night mode / Normalization)
     if (normComp) {
-      if (e.normalize) {
+      if (e.nightMode) {
+        normComp.threshold.value = -30; normComp.knee.value = 35;
+        normComp.ratio.value = 12; normComp.attack.value = 0.003; normComp.release.value = 0.35;
+        normMakeup.gain.value = 2.4;
+      } else if (e.normalize) {
         normComp.threshold.value = -24; normComp.knee.value = 30;
         normComp.ratio.value = 4; normComp.attack.value = 0.01; normComp.release.value = 0.25;
         normMakeup.gain.value = 1.8;
@@ -537,9 +823,6 @@
         normMakeup.gain.value = 1;
       }
     }
-
-    // 3D virtual surround (HRTF): 0..100 -> 0..~1.2 wet level.
-    if (hrtfWet) hrtfWet.gain.value = (e.surround3d || 0) / 100 * 1.2;
 
     // Safety limiter: a fast, hard-ish compressor near 0 dBFS when enabled.
     if (brickLimiter) {
@@ -563,15 +846,26 @@
    *  state.eq (so flipping bypass off restores the user's settings exactly). */
   function neutralizeEffects() {
     eqNodes.forEach((n) => { n.gain.value = 0; });
+    if (subBassNode) subBassNode.gain.value = 0;
     if (xbass) xbass.gain.value = 0;
+    if (vocalBoostNode) vocalBoostNode.gain.value = 0;
+    if (deEsserNode) deEsserNode.gain.value = 0;
+    if (clarityNode) clarityNode.gain.value = 0;
+    if (lofiDryGain) { lofiDryGain.gain.value = 1; lofiWetGain.gain.value = 0; }
     if (widenGLL) { widenGLL.gain.value = 1; widenGRL.gain.value = 0; widenGLR.gain.value = 0; widenGRR.gain.value = 1; }
     if (widenWet) widenWet.gain.value = 0;
     if (reverbWet) reverbWet.gain.value = 0;
     if (dryGain) dryGain.gain.value = 1;
     if (surroundWet) surroundWet.gain.value = 0;
+    if (echoWet) { echoWet.gain.value = 0; echoFbL.gain.value = 0; echoFbR.gain.value = 0; }
+    if (chorusWet) chorusWet.gain.value = 0;
     if (cfCrossL) { cfCrossL.gain.value = 0; cfCrossR.gain.value = 0; }
     if (vrRtoL) { vrRtoL.gain.value = 0; vrLtoR.gain.value = 0; }
     if (hrtfWet) hrtfWet.gain.value = 0;
+    if (orbitWet) orbitWet.gain.value = 0;
+    checkOrbitLoop();
+    if (monoDirectL) { monoDirectL.gain.value = 1; monoDirectR.gain.value = 1; monoCrossL.gain.value = 0; monoCrossR.gain.value = 0; }
+    if (panNode) panNode.pan.value = 0;
     if (normComp) { normComp.threshold.value = 0; normComp.ratio.value = 1; normComp.knee.value = 0; }
     if (normMakeup) normMakeup.gain.value = 1;
     if (brickLimiter) { brickLimiter.threshold.value = 0; brickLimiter.ratio.value = 1; brickLimiter.knee.value = 0; }
@@ -611,9 +905,26 @@
     }
     return out;
   }
+  let cachedThemeColors = null;
+  function updateThemeColors() {
+    try {
+      const cs = getComputedStyle(document.documentElement);
+      cachedThemeColors = {
+        green: cs.getPropertyValue("--green").trim() || "#1ED760",
+        greenDim: cs.getPropertyValue("--green-dim").trim() || "#15A049",
+        teal: cs.getPropertyValue("--teal").trim() || "#17C9C0",
+        greenGlow: cs.getPropertyValue("--green-glow").trim() || "rgba(30,215,96,.35)",
+        greenGlowSubtle: cs.getPropertyValue("--green-glow-subtle").trim() || "rgba(30,215,96,.14)",
+        tealGlowSubtle: cs.getPropertyValue("--teal-glow-subtle").trim() || "rgba(23,201,192,.14)",
+      };
+    } catch (_) {}
+  }
   function vizGradient() {
+    if (!cachedThemeColors) updateThemeColors();
     const g = vizCtx.createLinearGradient(0, vizH, 0, 0);
-    g.addColorStop(0, "#15A049"); g.addColorStop(0.55, "#1ED760"); g.addColorStop(1, "#17C9C0");
+    g.addColorStop(0, cachedThemeColors.greenDim);
+    g.addColorStop(0.55, cachedThemeColors.green);
+    g.addColorStop(1, cachedThemeColors.teal);
     return g;
   }
 
@@ -712,8 +1023,8 @@
     for (let i = 0; i < n; i++) vizCtx.lineTo(i * step, y(pts[i]));
     vizCtx.lineTo(vizW, mid);
     const fill = vizCtx.createLinearGradient(0, 0, 0, vizH);
-    fill.addColorStop(0, "rgba(30,215,96,.28)");
-    fill.addColorStop(1, "rgba(23,201,192,.03)");
+    fill.addColorStop(0, cachedThemeColors ? cachedThemeColors.greenGlow : "rgba(30,215,96,.28)");
+    fill.addColorStop(1, cachedThemeColors ? cachedThemeColors.tealGlowSubtle : "rgba(23,201,192,.03)");
     vizCtx.fillStyle = fill;
     vizCtx.fill();
 
@@ -721,7 +1032,7 @@
     vizCtx.beginPath();
     for (let i = 0; i < n; i++) (i ? vizCtx.lineTo : vizCtx.moveTo).call(vizCtx, i * step, y(pts[i]));
     vizCtx.lineWidth = 2.5;
-    vizCtx.strokeStyle = "#1ED760";
+    vizCtx.strokeStyle = cachedThemeColors ? cachedThemeColors.green : "#1ED760";
     vizCtx.lineJoin = "round";
     vizCtx.stroke();
   }
@@ -748,7 +1059,7 @@
     vizCtx.beginPath();
     vizCtx.arc(cx, cy, baseR, 0, Math.PI * 2);
     vizCtx.lineWidth = 2;
-    vizCtx.strokeStyle = "rgba(30,215,96,.35)";
+    vizCtx.strokeStyle = cachedThemeColors ? cachedThemeColors.greenGlow : "rgba(30,215,96,.35)";
     vizCtx.stroke();
   }
 
@@ -797,8 +1108,8 @@
     // Pulsing central core that scales with the current level.
     const coreR = 4 + energy * Math.min(vizW, vizH) * 0.13;
     const g = vizCtx.createRadialGradient(cx, cy, 0, cx, cy, coreR);
-    g.addColorStop(0, "rgba(30,215,96,.9)");
-    g.addColorStop(1, "rgba(23,201,192,0)");
+    g.addColorStop(0, cachedThemeColors ? cachedThemeColors.green : "rgba(30,215,96,.9)");
+    g.addColorStop(1, "transparent");
     vizCtx.fillStyle = g;
     vizCtx.beginPath(); vizCtx.arc(cx, cy, coreR, 0, Math.PI * 2); vizCtx.fill();
   }
@@ -821,6 +1132,10 @@
       case "ALBUM_ARTIST": s.sort((a, b) => cmpStr(a.albumArtist || a.artist, b.albumArtist || b.artist)); break;
       case "ALBUM": s.sort((a, b) => cmpStr(a.album, b.album) || cmpStr(a.title, b.title)); break;
       case "DURATION": s.sort((a, b) => (a.duration || 0) - (b.duration || 0)); break;
+      // Newest-added first (highest file mtime first); tracks with no timestamp last.
+      case "DATE_ADDED": s.sort((a, b) =>
+        (nullsLast((x) => x.addedAt)(a) - nullsLast((x) => x.addedAt)(b)) ||
+        ((b.addedAt || 0) - (a.addedAt || 0)) || cmpStr(a.title, b.title)); break;
       case "YEAR": s.sort((a, b) => (nullsLast((x) => x.year)(a) - nullsLast((x) => x.year)(b)) || ((a.year || 0) - (b.year || 0))); break;
       case "MUSIC_DIRECTOR": s.sort((a, b) => cmpStr(a.musicDirector, b.musicDirector)); break;
       case "ACTOR": s.sort((a, b) => cmpStr(a.actors, b.actors)); break;
@@ -1124,25 +1439,92 @@
       const h = Math.floor((secs || 0) / 3600), m = Math.round(((secs || 0) % 3600) / 60);
       return h ? `${h}h ${m}m` : `${m}m`;
     };
+    const avg = (d.uniqueTracks > 0) ? (d.totalPlays / d.uniqueTracks).toFixed(1) : "0";
     const tile = (label, val) => `<div class="stat-tile"><div class="stat-num">${esc(String(val))}</div><div class="stat-label">${esc(label)}</div></div>`;
-    const rows = (arr, cols) => (arr && arr.length)
-      ? arr.map((x, i) => `<div class="stat-row"><span class="stat-rank">${i + 1}</span>${cols(x)}</div>`).join("")
+    const rows = (arr, cols, attrs) => (arr && arr.length)
+      ? arr.map((x, i) => `<div class="stat-row"${attrs ? attrs(x) : ""}><span class="stat-rank">${i + 1}</span>${cols(x)}</div>`).join("")
       : `<div class="stat-empty">Nothing yet.</div>`;
+    // A top track is clickable only if it still exists in the loaded catalog
+    // (styling comes from the .stat-row[data-play-path] CSS selector).
+    const trackAttrs = (x) => (x.path && state.songs.some((s) => s.path === x.path))
+      ? ` role="button" tabindex="0" data-play-path="${esc(x.path)}" title="Play ${esc(x.title || "")}"` : "";
+
+    // Bar chart: plays per day over the last 14 days.
+    const perDay = d.perDay || [];
+    const maxDay = Math.max(1, ...perDay.map((x) => x.plays || 0));
+    const dayLbl = (iso) => { const [, , dd] = (iso || "").split("-"); return dd || ""; };
+    const dayBars = perDay.map((x) => {
+      const h = Math.round(((x.plays || 0) / maxDay) * 100);
+      return `<div class="chart-col" title="${esc(x.date)}: ${x.plays || 0} play${x.plays === 1 ? "" : "s"}">
+        <div class="chart-bar-wrap"><div class="chart-bar" style="height:${h}%"></div></div>
+        <div class="chart-xlabel">${esc(dayLbl(x.date))}</div></div>`;
+    }).join("");
+
+    // Listening clock: plays by hour of day (0..23).
+    const byHour = d.byHour || [];
+    const maxHour = Math.max(1, ...byHour);
+    const hourBars = byHour.map((n, h) => {
+      const ht = Math.round((n / maxHour) * 100);
+      return `<div class="chart-col" title="${String(h).padStart(2, "0")}:00 — ${n} play${n === 1 ? "" : "s"}">
+        <div class="chart-bar-wrap"><div class="chart-bar" style="height:${ht}%"></div></div>
+        <div class="chart-xlabel">${h % 6 === 0 ? String(h).padStart(2, "0") : ""}</div></div>`;
+    }).join("");
+
+    const hasAny = (d.totalPlays || 0) > 0;
+    const span = (d.firstPlay && d.lastPlay)
+      ? `<p class="stats-span">History from ${esc(fmtDate(d.firstPlay))} to ${esc(fmtDate(d.lastPlay))}.</p>` : "";
 
     songList.innerHTML = `
       <div class="stat-tiles">
         ${tile("Total plays", d.totalPlays || 0)}
         ${tile("Listening time", fmtH(d.totalSeconds))}
         ${tile("Unique tracks", d.uniqueTracks || 0)}
+        ${tile("Avg plays / track", avg)}
       </div>
+      ${span}
+      ${hasAny ? `
+      <div class="stat-charts">
+        <div class="stat-card chart-card"><h3>Plays — last 14 days</h3>
+          <div class="bar-chart">${dayBars}</div></div>
+        <div class="stat-card chart-card"><h3>Listening clock (by hour)</h3>
+          <div class="bar-chart clock">${hourBars}</div></div>
+      </div>` : ""}
       <div class="stat-cols">
         <div class="stat-card"><h3>Top tracks</h3>${rows(d.topTracks, (x) =>
-          `<span class="stat-main">${esc(x.title || "")}<em>${esc(x.artist || "")}</em></span><span class="stat-count">${x.plays || 0}</span>`)}</div>
+          `<span class="stat-main">${esc(x.title || "")}<em>${esc(x.artist || "")}</em></span><span class="stat-count">${x.plays || 0}</span>`, trackAttrs)}</div>
         <div class="stat-card"><h3>Top artists</h3>${rows(d.topArtists, (x) =>
           `<span class="stat-main">${esc(x.artist || "")}</span><span class="stat-count">${x.plays || 0}</span>`)}</div>
+        <div class="stat-card"><h3>Top albums</h3>${rows(d.topAlbums, (x) =>
+          `<span class="stat-main">${esc(x.album || "")}</span><span class="stat-count">${x.plays || 0}</span>`)}</div>
         <div class="stat-card"><h3>Recently played</h3>${rows(d.recent, (x) =>
           `<span class="stat-main">${esc(x.title || "")}<em>${esc(x.artist || "")}</em></span>`)}</div>
       </div>`;
+
+    // Clicking (or Enter/Space on) a top-track row starts playback of that song.
+    songList.querySelectorAll(".stat-row[data-play-path]").forEach((rowEl) => {
+      const play = () => playByPath(rowEl.dataset.playPath);
+      rowEl.addEventListener("click", play);
+      rowEl.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); play(); }
+      });
+    });
+  }
+
+  /** Start playback of the catalog track with this server-relative path, in the
+   *  context of the full song list. No-op if the track is no longer loaded. */
+  function playByPath(path) {
+    const list = state.songs;
+    const idx = list.findIndex((s) => s.path === path);
+    if (idx < 0) { toast("That track isn’t in the current library"); return; }
+    playFromContext(list, idx);
+  }
+
+  /** Short local date (e.g. "Oct 17") from a unix-seconds timestamp. */
+  function fmtDate(ts) {
+    try {
+      return new Date((ts || 0) * 1000).toLocaleDateString(undefined,
+        { month: "short", day: "numeric" });
+    } catch { return ""; }
   }
 
   function render() {
@@ -1244,6 +1626,7 @@
         ${song.format ? `<span class="pill ${lossless ? "lossless" : ""}">${esc((song.format || "").toUpperCase())}</span>` : ""}
       </div>
       <div class="s-right">
+        <span class="s-plays" hidden></span>
         <span class="s-dur">${fmtTime(song.duration || 0)}</span>
         <span class="s-actions">
           <button class="icon-btn small lyr ${song.hasLyrics ? "on" : ""}" title="${song.hasLyrics ? "Lyrics available" : "No lyrics file"}" aria-label="Show lyrics">${ICONS.lyrics}</button>
@@ -1254,6 +1637,7 @@
         </span>
       </div>`;
     paintArt(row.querySelector(".s-art"), artUrlFor(song));
+    setPlayBadge(row.querySelector(".s-plays"), playCountOf(song));
 
     row.addEventListener("click", (ev) => {
       if (ev.target.closest(".s-actions")) return;
@@ -1805,6 +2189,7 @@
 
   function play() {
     initAudioGraph();
+    ensureNotifyPermission();   // request notification permission within this user gesture
     if (ac && ac.state === "suspended") ac.resume();
     act().play().catch(() => {});
   }
@@ -1859,6 +2244,12 @@
   function scrobble(song) {
     if (!song || song.id === lastScrobbledId) return;
     lastScrobbledId = song.id;
+    // Optimistically bump the per-song counter so the badge reacts immediately;
+    // the server's own tally is the source of truth on the next /playcounts fetch.
+    if (song.path) {
+      state.playCounts[song.path] = (state.playCounts[song.path] || 0) + 1;
+      refreshPlayCounts();
+    }
     try {
       apiFetch("/scrobble", {
         method: "POST",
@@ -1971,6 +2362,7 @@
     favBtn.classList.toggle("on", faved);
     $("#np-edit").hidden = !(state.caps.canEditTags && !!s);
     document.title = s ? `${s.title} — AuraWave` : "AuraWave — Web Player";
+    notifyNowPlaying(s);   // OS notification on track change when backgrounded
   }
   function updateCounts() {
     $("#count-library").textContent = state.songs.length;
@@ -2090,6 +2482,132 @@
     try {
       navigator.mediaSession.setActionHandler("seekto", (d) => { if (d.seekTime != null) act().currentTime = d.seekTime; });
     } catch {}
+    try { navigator.mediaSession.setActionHandler("stop", pause); } catch {}
+    updatePositionState();
+  }
+
+  /** Feed the current position/duration to the OS media controls so their
+   *  notification shows a live, scrubbable progress bar. */
+  function updatePositionState() {
+    if (!("mediaSession" in navigator) || !navigator.mediaSession.setPositionState) return;
+    const d = act();
+    if (!d || !isFinite(d.duration) || d.duration <= 0) return;
+    try {
+      navigator.mediaSession.setPositionState({
+        duration: d.duration,
+        playbackRate: d.playbackRate || 1,
+        position: Math.min(Math.max(d.currentTime || 0, 0), d.duration),
+      });
+    } catch {}
+  }
+
+  // ----------------------------------------------------------------- desktop notifications
+  // Pop an OS notification naming the track whenever it changes while the page
+  // isn't visible (background tab or the browser minimized), so you know what's
+  // playing without switching back. Where a service worker is available (a secure
+  // context — https or localhost) the notification also carries working
+  // Prev / Play-Pause / Next buttons that relay back to this page; otherwise we
+  // fall back to a plain, button-less notification. (The browser's own media
+  // controls, driven by the Media Session API below, offer the same transport
+  // buttons independently of all this.) Permission is requested on first play (a
+  // user gesture, which browsers require). Same-track and foreground updates are
+  // suppressed, and the single notification is updated in place, never stacked.
+  const canNotify = () => typeof Notification !== "undefined";
+  let lastNotifiedId = null;
+  let activeNotification = null;   // the plain (non-SW) fallback notification
+  let swReg = null;                // service-worker registration, when available
+
+  /** Register the service worker that hosts the action-button notification and
+   *  relays its button taps back here. No-op without SW support / secure context. */
+  function registerNotifyWorker() {
+    if (!("serviceWorker" in navigator)) return;
+    navigator.serviceWorker.register("sw.js").then((reg) => { swReg = reg; }).catch(() => {});
+    // `ready` resolves with the active registration (so `.active` is usable).
+    navigator.serviceWorker.ready.then((reg) => { swReg = reg; }).catch(() => {});
+    navigator.serviceWorker.addEventListener("message", (ev) => {
+      const d = ev.data || {};
+      if (d.type !== "mediaAction") return;
+      // A transport button on the notification was tapped — act on it, then re-post
+      // the notification so its Play/Pause label reflects the new state.
+      switch (d.action) {
+        case "play": play(); break;
+        case "pause": pause(); break;
+        case "next": next(false); break;
+        case "prev": prev(); break;
+        case "open": try { window.focus(); } catch {} break;
+      }
+      setTimeout(refreshNowPlayingNotification, 60);
+    });
+  }
+
+  /** Ask for notification permission once, from within a user gesture (play). */
+  function ensureNotifyPermission() {
+    if (!canNotify() || Notification.permission !== "default") return;
+    try { Notification.requestPermission().catch(() => {}); } catch {}
+  }
+
+  /** Transport buttons for the notification: just Play/Pause + Next (Prev is
+   *  omitted on purpose — it only goes back to an already-played track). Trimmed
+   *  to the platform's action cap (`Notification.maxActions`) when it's below 2. */
+  function nowPlayingActions(playing) {
+    const pp = playing ? { action: "pause", title: "⏸ Pause" } : { action: "play", title: "▶ Play" };
+    const next = { action: "next", title: "⏭ Next" };
+    const max = (canNotify() && typeof Notification.maxActions === "number") ? Notification.maxActions : 2;
+    if (max >= 2) return [pp, next];
+    if (max === 1) return [pp];
+    return [];
+  }
+
+  /** The message payload describing the current track for the SW notification. */
+  function nowPlayingPayload(song) {
+    const playing = !act().paused;
+    return {
+      type: "nowplaying",
+      title: song.title || "Now playing",
+      body: [song.artist, song.album].filter(Boolean).join(" • ") || "AuraWave",
+      icon: artUrlFor(song) || undefined,
+      playing,
+      actions: nowPlayingActions(playing),
+    };
+  }
+
+  /** Try to show/update the rich (buttoned) notification via the service worker.
+   *  Returns true if the SW handled it, false to fall back to a plain notification. */
+  function showWorkerNotification(song) {
+    if (!swReg || !swReg.active) return false;
+    try { swReg.active.postMessage(nowPlayingPayload(song)); return true; }
+    catch { return false; }
+  }
+
+  /** Show a "now playing" notification for a track change made while hidden. */
+  function notifyNowPlaying(song) {
+    if (!canNotify() || Notification.permission !== "granted") return;
+    if (!song || !document.hidden) return;       // only when backgrounded
+    if (song.id === lastNotifiedId) return;       // only on an actual change
+    lastNotifiedId = song.id;
+    if (showWorkerNotification(song)) return;     // rich notification with buttons
+    // Fallback: a plain notification (no transport buttons).
+    try {
+      if (activeNotification) { try { activeNotification.close(); } catch {} }
+      const n = new Notification(song.title || "Now playing", {
+        body: [song.artist, song.album].filter(Boolean).join(" • ") || "AuraWave",
+        icon: artUrlFor(song) || undefined,
+        tag: "aurawave-nowplaying",   // coalesce: replace the previous one, don't stack
+        silent: true,                 // the music is already the sound — no ding
+      });
+      activeNotification = n;
+      // Clicking the notification brings the player back to the foreground.
+      n.onclick = () => { try { window.focus(); } catch {} try { n.close(); } catch {} };
+    } catch { /* notifications unsupported / blocked -> ignore */ }
+  }
+
+  /** Re-post the current notification so its Play/Pause button matches the live
+   *  playback state. Called when play/pause toggles while the page is hidden. */
+  function refreshNowPlayingNotification() {
+    if (!canNotify() || Notification.permission !== "granted") return;
+    const s = currentSong();
+    if (!s || !document.hidden) return;
+    showWorkerNotification(s);
   }
 
   // ----------------------------------------------------------------- loading songs
@@ -2139,11 +2657,55 @@
       render();
       restoreScroll();         // jump back to where you were on reload
       fetchCapabilities();     // capabilities belong to the server we just loaded from
+      loadPlayCounts();        // per-song play tallies from the server's history
       toast(`Loaded ${data.length} track${data.length === 1 ? "" : "s"}`);
     } catch (err) {
       toast("Could not load songs: " + err.message);
       state.songs = [];
       render();
+    }
+  }
+
+  /** Fetch GET /playcounts ({path: count}) and refresh the visible rows. Silently
+   *  no-ops on servers that don't track history (older/other AuraWave backends). */
+  async function loadPlayCounts() {
+    try {
+      const r = await apiFetch("/playcounts", { cache: "no-store" });
+      if (!r.ok) return;
+      const map = await r.json();
+      if (map && typeof map === "object") {
+        state.playCounts = map;
+        refreshPlayCounts();
+      }
+    } catch { /* server has no play history — leave counts empty */ }
+  }
+
+  /** Play count for a song, keyed by its server-relative path. */
+  function playCountOf(song) {
+    return (song && song.path && state.playCounts[song.path]) || 0;
+  }
+
+  /** Update the play-count badge on every currently-rendered row in place,
+   *  without a full re-render (cheap enough to call after each scrobble). */
+  function refreshPlayCounts() {
+    $$(".song-row").forEach((row) => {
+      const song = state.songs.find((s) => String(s.id) === row.dataset.id);
+      if (!song) return;
+      const badge = row.querySelector(".s-plays");
+      if (badge) setPlayBadge(badge, playCountOf(song));
+    });
+  }
+
+  /** Render a play-count badge: hidden at 0 plays, "▶ N" otherwise. */
+  function setPlayBadge(badge, n) {
+    if (n > 0) {
+      badge.hidden = false;
+      badge.textContent = "▶ " + n;
+      badge.title = n + (n === 1 ? " play" : " plays");
+      badge.setAttribute("aria-label", badge.title);
+    } else {
+      badge.hidden = true;
+      badge.textContent = "";
     }
   }
 
@@ -2250,6 +2812,31 @@
     $("#fx-surround3d").value = state.eq.surround3d; $("#fx-surround3d-val").textContent = state.eq.surround3d;
     $("#fx-limiter").checked = state.eq.limiter;
     $("#fx-normalize").checked = state.eq.normalize;
+
+    // Sync extended tone, spatial, and dynamic controls
+    if ($("#fx-clarity")) { $("#fx-clarity").value = state.eq.clarity; $("#fx-clarity-val").textContent = state.eq.clarity; }
+    if ($("#fx-vocalboost")) { $("#fx-vocalboost").value = state.eq.vocalBoost; $("#fx-vocalboost-val").textContent = state.eq.vocalBoost; }
+    if ($("#fx-subbass")) { $("#fx-subbass").value = state.eq.subBass; $("#fx-subbass-val").textContent = state.eq.subBass; }
+    if ($("#fx-deesser")) { $("#fx-deesser").value = state.eq.deEsser; $("#fx-deesser-val").textContent = state.eq.deEsser; }
+    if ($("#fx-loudnesscomp")) $("#fx-loudnesscomp").checked = state.eq.loudnessComp;
+    if ($("#fx-orbit8d")) { $("#fx-orbit8d").value = state.eq.orbit8d; $("#fx-orbit8d-val").textContent = state.eq.orbit8d === 0 ? "Off" : state.eq.orbit8d; }
+    if ($("#fx-echo")) { $("#fx-echo").value = state.eq.echo; $("#fx-echo-val").textContent = state.eq.echo; }
+    if ($("#fx-echotime")) { $("#fx-echotime").value = state.eq.echoTime; $("#fx-echotime-val").textContent = state.eq.echoTime + "ms"; }
+    if ($("#fx-chorus")) { $("#fx-chorus").value = state.eq.chorus; $("#fx-chorus-val").textContent = state.eq.chorus; }
+    if ($("#fx-balance")) {
+      $("#fx-balance").value = state.eq.balance;
+      const b = state.eq.balance;
+      $("#fx-balance-val").textContent = b === 0 ? "Center" : (b < 0 ? Math.abs(b) + "% L" : b + "% R");
+    }
+    if ($("#fx-mono")) $("#fx-mono").checked = state.eq.mono;
+    if ($("#fx-warmth")) { $("#fx-warmth").value = state.eq.warmth; $("#fx-warmth-val").textContent = state.eq.warmth; }
+    if ($("#fx-nightmode")) $("#fx-nightmode").checked = state.eq.nightMode;
+
+    const isSlowed = state.eq.speed === 0.85 && !state.eq.pitch && state.eq.reverb === "HALL";
+    if ($("#fx-mode-slowed")) $("#fx-mode-slowed").classList.toggle("active", isSlowed);
+    const isNightcore = state.eq.speed === 1.25 && !state.eq.pitch && state.eq.clarity >= 30;
+    if ($("#fx-mode-nightcore")) $("#fx-mode-nightcore").classList.toggle("active", isNightcore);
+
     syncStemUi();
   }
 
@@ -2403,6 +2990,142 @@
     t.textContent = msg; t.hidden = false;
     clearTimeout(toastTimer);
     toastTimer = setTimeout(() => { t.hidden = true; }, 2200);
+  }
+
+  // ----------------------------------------------------------------- themes & palette
+  const THEMES = [
+    {
+      id: "dark",
+      name: "Emerald Aura",
+      primary: "#1ED760",
+      secondary: "#17C9C0",
+      bg: "#0E0F11",
+      surface: "#16181B",
+      themeColor: "#0E0F11",
+    },
+    {
+      id: "cyberpunk",
+      name: "Cyberpunk",
+      primary: "#A855F7",
+      secondary: "#EC4899",
+      bg: "#0C0915",
+      surface: "#140F24",
+      themeColor: "#0C0915",
+    },
+    {
+      id: "ocean",
+      name: "Ocean Sapphire",
+      primary: "#38BDF8",
+      secondary: "#2DD4BF",
+      bg: "#090E17",
+      surface: "#0F172A",
+      themeColor: "#090E17",
+    },
+    {
+      id: "sunset",
+      name: "Sunset Amber",
+      primary: "#F97316",
+      secondary: "#FB7185",
+      bg: "#120B08",
+      surface: "#1C120C",
+      themeColor: "#120B08",
+    },
+    {
+      id: "crimson",
+      name: "Crimson Ruby",
+      primary: "#F43F5E",
+      secondary: "#FB923C",
+      bg: "#12080A",
+      surface: "#1C0D11",
+      themeColor: "#12080A",
+    },
+    {
+      id: "golden",
+      name: "Golden Hour",
+      primary: "#EAB308",
+      secondary: "#F59E0B",
+      bg: "#121008",
+      surface: "#1C190D",
+      themeColor: "#121008",
+    },
+    {
+      id: "nord",
+      name: "Nordic Frost",
+      primary: "#88C0D0",
+      secondary: "#A3BE8C",
+      bg: "#242933",
+      surface: "#2E3440",
+      themeColor: "#242933",
+    },
+    {
+      id: "amoled",
+      name: "AMOLED Black",
+      primary: "#00E676",
+      secondary: "#00E5FF",
+      bg: "#000000",
+      surface: "#0A0A0A",
+      themeColor: "#000000",
+    },
+    {
+      id: "light",
+      name: "Solar Light",
+      primary: "#0284C7",
+      secondary: "#0D9488",
+      bg: "#F8FAFC",
+      surface: "#FFFFFF",
+      themeColor: "#F8FAFC",
+    },
+  ];
+
+  function applyTheme(themeId, notify) {
+    const theme = THEMES.find((t) => t.id === themeId) || THEMES[0];
+    document.documentElement.setAttribute("data-theme", theme.id);
+    ls.set("theme", theme.id);
+    const metaTheme = document.querySelector('meta[name="theme-color"]');
+    if (metaTheme && theme.themeColor) metaTheme.setAttribute("content", theme.themeColor);
+    const btn = $("#btn-theme");
+    if (btn) btn.textContent = `🎨 Theme: ${theme.name}`;
+    updateThemeColors();
+    renderThemeModal();
+    if (notify) toast(`Switched theme to ${theme.name}`);
+  }
+
+  function openThemeModal() {
+    renderThemeModal();
+    $("#theme-scrim").hidden = false;
+  }
+
+  function closeThemeModal() {
+    $("#theme-scrim").hidden = true;
+  }
+
+  function renderThemeModal() {
+    const grid = $("#theme-grid");
+    if (!grid) return;
+    const curTheme = document.documentElement.getAttribute("data-theme") || "dark";
+    grid.innerHTML = "";
+    THEMES.forEach((t) => {
+      const card = document.createElement("button");
+      card.type = "button";
+      card.className = "theme-card" + (t.id === curTheme ? " active" : "");
+      card.innerHTML = `
+        <div class="theme-swatch" style="background:${t.bg};">
+          <div class="theme-swatch-surface" style="background:${t.surface};"></div>
+          <div class="theme-swatch-dots">
+            <span class="theme-dot" style="background:${t.primary};"></span>
+            <span class="theme-dot" style="background:${t.secondary};"></span>
+          </div>
+        </div>
+        <div class="theme-card-info">
+          <span class="theme-card-name">${t.name}</span>
+          <span class="theme-card-badge">✓ Active</span>
+        </div>
+      `;
+      card.addEventListener("click", () => {
+        applyTheme(t.id, true);
+      });
+      grid.appendChild(card);
+    });
   }
 
   // ----------------------------------------------------------------- tag & art editor
@@ -2819,6 +3542,61 @@
     fxBind("#fx-surround3d", "surround3d", "#fx-surround3d-val");
     $("#fx-limiter").addEventListener("change", (e) => { state.eq.limiter = e.target.checked; persistEq(); applyEffects(); });
 
+    // Extended audio effect bindings
+    fxBind("#fx-clarity", "clarity", "#fx-clarity-val");
+    fxBind("#fx-vocalboost", "vocalBoost", "#fx-vocalboost-val");
+    fxBind("#fx-subbass", "subBass", "#fx-subbass-val");
+    fxBind("#fx-deesser", "deEsser", "#fx-deesser-val");
+    if ($("#fx-loudnesscomp")) $("#fx-loudnesscomp").addEventListener("change", (e) => { state.eq.loudnessComp = e.target.checked; persistEq(); applyEffects(); });
+
+    if ($("#fx-orbit8d")) $("#fx-orbit8d").addEventListener("input", (e) => {
+      state.eq.orbit8d = Number(e.target.value);
+      $("#fx-orbit8d-val").textContent = state.eq.orbit8d === 0 ? "Off" : state.eq.orbit8d;
+      persistEq(); applyEffects();
+    });
+    fxBind("#fx-echo", "echo", "#fx-echo-val");
+    if ($("#fx-echotime")) $("#fx-echotime").addEventListener("input", (e) => {
+      state.eq.echoTime = Number(e.target.value);
+      $("#fx-echotime-val").textContent = e.target.value + "ms";
+      persistEq(); applyEffects();
+    });
+    fxBind("#fx-chorus", "chorus", "#fx-chorus-val");
+    if ($("#fx-balance")) $("#fx-balance").addEventListener("input", (e) => {
+      state.eq.balance = Number(e.target.value);
+      const b = state.eq.balance;
+      $("#fx-balance-val").textContent = b === 0 ? "Center" : (b < 0 ? Math.abs(b) + "% L" : b + "% R");
+      persistEq(); applyEffects();
+    });
+    if ($("#fx-mono")) $("#fx-mono").addEventListener("change", (e) => { state.eq.mono = e.target.checked; persistEq(); applyEffects(); });
+    fxBind("#fx-warmth", "warmth", "#fx-warmth-val");
+    if ($("#fx-nightmode")) $("#fx-nightmode").addEventListener("change", (e) => { state.eq.nightMode = e.target.checked; persistEq(); applyEffects(); });
+
+    if ($("#fx-mode-slowed")) $("#fx-mode-slowed").addEventListener("click", () => {
+      const isSlowed = state.eq.speed === 0.85 && !state.eq.pitch && state.eq.reverb === "HALL";
+      if (isSlowed) {
+        state.eq.speed = 1.0; state.eq.pitch = true; state.eq.reverb = "OFF";
+        state.eq.subBass = 0; state.eq.warmth = 0;
+        toast("Slowed mode turned off");
+      } else {
+        state.eq.speed = 0.85; state.eq.pitch = false; state.eq.reverb = "HALL";
+        state.eq.subBass = 30; state.eq.warmth = 20;
+        toast("🌙 Slowed + Reverb enabled");
+      }
+      persistEq(); buildEqPanel(); applyEffects();
+    });
+
+    if ($("#fx-mode-nightcore")) $("#fx-mode-nightcore").addEventListener("click", () => {
+      const isNightcore = state.eq.speed === 1.25 && !state.eq.pitch && state.eq.clarity >= 30;
+      if (isNightcore) {
+        state.eq.speed = 1.0; state.eq.pitch = true; state.eq.clarity = 0; state.eq.subBass = 0;
+        toast("Nightcore mode turned off");
+      } else {
+        state.eq.speed = 1.25; state.eq.pitch = false; state.eq.clarity = 40; state.eq.subBass = 20;
+        toast("⚡ Nightcore mode enabled");
+      }
+      persistEq(); buildEqPanel(); applyEffects();
+    });
+
     // A/B bypass: toggle all tonal/spatial effects off for comparison.
     $("#btn-ab").addEventListener("click", () => {
       bypassAll = !bypassAll;
@@ -2852,6 +3630,9 @@
         crossfade: 0, normalize: false, crossfeed: 0,
         vocalRemove: false, vocalStrength: 100, vocalMode: "client",
         limiter: true, surround3d: 0, eqMode: "graphic",
+        clarity: 0, vocalBoost: 0, subBass: 0, deEsser: 0,
+        warmth: 0, echo: 0, echoTime: 350, chorus: 0, orbit8d: 0,
+        balance: 0, mono: false, nightMode: false, loudnessComp: false,
         eqParam: EQ_FREQS.map((f, i) => ({
           type: i === 0 ? "lowshelf" : i === EQ_FREQS.length - 1 ? "highshelf" : "peaking",
           freq: f, gain: 0, q: 1.1,
@@ -2859,6 +3640,7 @@
       };
       persistEq(); buildEqPanel(); applyEffects();
       $("#btn-speed").textContent = "1.0×";
+      toast("Reset all audio effects to default");
     });
 
     // volume
@@ -2886,6 +3668,7 @@
         $("#np-cur").textContent = fmtTime(d.currentTime);
         if (d.duration) { seek.value = Math.round((d.currentTime / d.duration) * 1000); fillRange(seek); }
         savePlaybackState();   // throttled (every 5s) resume checkpoint
+        updatePositionState(); // keep the OS media-controls progress bar in sync
         syncLrc();             // highlight the current synced-lyrics line
         // Begin the crossfade / gapless hand-off near the end of the track.
         if (!crossfading && d.duration && isFinite(d.duration)) {
@@ -2907,8 +3690,8 @@
       });
       d.addEventListener("durationchange", () => { if (d === act()) $("#np-dur").textContent = fmtTime(d.duration); });
       d.addEventListener("ended", () => { if (d === act() && !crossfading) next(true); });
-      d.addEventListener("play", () => { if (d !== act()) return; setIcon($("#btn-play"), "pause"); if (ac && ac.state === "suspended") ac.resume(); if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "playing"; });
-      d.addEventListener("pause", () => { if (d !== act() || crossfading) return; setIcon($("#btn-play"), "play"); savePlaybackState(true); if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "paused"; });
+      d.addEventListener("play", () => { if (d !== act()) return; setIcon($("#btn-play"), "pause"); if (ac && ac.state === "suspended") ac.resume(); checkOrbitLoop(); if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "playing"; refreshNowPlayingNotification(); });
+      d.addEventListener("pause", () => { if (d !== act() || crossfading) return; setIcon($("#btn-play"), "play"); checkOrbitLoop(); savePlaybackState(true); if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "paused"; refreshNowPlayingNotification(); });
       d.addEventListener("error", () => {
         const s = currentSong();
         if (d !== act() || crossfading || !s) return;
@@ -2942,6 +3725,13 @@
       });
     });
     window.addEventListener("beforeunload", () => savePlaybackState(true));
+
+    // When the window is minimized / the tab is backgrounded while a track is
+    // playing, surface the now-playing notification right away (with its transport
+    // buttons) — not only on the next track change.
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden && currentSong() && !act().paused) refreshNowPlayingNotification();
+    });
 
     // Visualizer: enlarge toggle + full screen, and keep the canvas crisp on resize.
     $("#viz-enlarge").addEventListener("click", () => {
@@ -2978,11 +3768,10 @@
 
     // sidebar footer
     $("#btn-qr").addEventListener("click", () => window.open("/qr", "_blank"));
-    $("#btn-theme").addEventListener("click", () => {
-      const cur = document.documentElement.getAttribute("data-theme");
-      const nxt = cur === "dark" ? "light" : "dark";
-      document.documentElement.setAttribute("data-theme", nxt);
-      ls.set("theme", nxt);
+    $("#btn-theme").addEventListener("click", openThemeModal);
+    $("#theme-cancel").addEventListener("click", closeThemeModal);
+    $("#theme-scrim").addEventListener("click", (e) => {
+      if (e.target === $("#theme-scrim")) closeThemeModal();
     });
 
     // modal
@@ -2998,7 +3787,8 @@
       else if (e.code === "ArrowRight" && e.shiftKey) next(false);
       else if (e.code === "ArrowLeft" && e.shiftKey) prev();
       else if (e.code === "Escape") {
-        if (nowPageOpen) closeNowPage();
+        if (!$("#theme-scrim").hidden) closeThemeModal();
+        else if (nowPageOpen) closeNowPage();
         else if (!$("#eq-panel").hidden) closeEq();
         else if (!$("#lyrics-panel").hidden) $("#lyrics-panel").hidden = true;
         else if (!$("#queue-panel").hidden) $("#queue-panel").hidden = true;
@@ -3009,7 +3799,7 @@
   // ----------------------------------------------------------------- init
   function init() {
     const savedTheme = ls.get("theme", "dark");
-    document.documentElement.setAttribute("data-theme", savedTheme);
+    applyTheme(savedTheme, false);
     const savedUrl = ls.get("serverUrl", "");
     if (savedUrl) $("#server-url").value = savedUrl;
 
@@ -3042,6 +3832,7 @@
     const topViews = ["library", "songs", "favorites", "recent", "albums", "artists", "years", "stats"];
     setView(topViews.includes(savedView) || savedView.startsWith("playlist:") ? savedView : "library");
     restorePlayback();       // restore the last queue + position (paused)
+    registerNotifyWorker();  // enable the action-button "now playing" notification
     loadSongs(savedUrl || "");   // load from this server by default
     fetchCapabilities();     // discover optional server features (tag editing, etc.)
   }

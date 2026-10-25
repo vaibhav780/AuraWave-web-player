@@ -1,0 +1,6 @@
+{
+  "music_folder": "D:\\songs",
+  "port": 8080,
+  "threads": 16,
+  "auto_start": true
+}

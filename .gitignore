@@ -14,8 +14,14 @@ ENV/
 library.db
 library.db-journal
 library.db-wal
+aurawave.db
+aurawave.db-journal
+aurawave.db-wal
 art_cache/
 lyrics_cache/
+stem_cache/
+service_state.json
+service.log
 
 # ---- Local music / media (never commit someone's library) ----
 *.mp3

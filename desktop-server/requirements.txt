@@ -7,6 +7,13 @@ waitress==3.0.0        # production-grade, pure-Python WSGI server (Windows-frie
 qrcode==7.4.2          # generates the "scan to connect" QR code (pure-Python, no Pillow needed)
 mutagen==1.47.0        # reads embedded audio tags (year / composer / genre / track number)
 
+# --- Optional: minimize-to-system-tray (Windows notification area) ----------
+# pystray + Pillow power the tray icon. They are installed best-effort by run.bat
+# (see requirements-tray.txt) and are NOT required: if they are missing, the app
+# simply closes normally on X instead of hiding to the tray. Kept out of the core
+# requirements so a missing prebuilt wheel (e.g. on a brand-new Python) can never
+# block the server from starting.
+
 # --- Optional: AI vocal removal + stem mixer (server-side Demucs) ------------
 # NOT installed by run.bat (large ~1GB download). To enable the AI features,
 # install Demucs INTO THIS venv and have ffmpeg on PATH:

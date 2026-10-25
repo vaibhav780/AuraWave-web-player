@@ -54,8 +54,7 @@ tag editor and instant folder-watching.
 <td width="50%" valign="top">
 
 ### 🖥️ `desktop-server/`
-A **GUI streaming server** with a live connected-devices panel. Also serves the web
-player UI at `/player/`.
+A **GUI streaming server** with Windows Service support (auto-start on boot), system tray minimization, and a live connected-devices panel. Also serves the web player UI at `/player/`.
 
 **Default port:** `8080`
 

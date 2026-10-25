@@ -182,13 +182,72 @@ value. A missing or malformed `metadata.json` is ignored.
 
 ---
 
+## 🚀 Running as a Windows Service (Start on Boot)
+
+AuraWave can run as a **native background Windows Service** that automatically starts when Windows boots up—even before logging in.
+
+### Default Configuration:
+- **Default Music Folder**: `D:\songs` (configurable in `config.json` or via GUI)
+- **Port**: `8080`
+- **Startup Mode**: `Automatic` (starts on Windows boot)
+
+### How to Install and Manage the Service:
+
+#### Option 1: Directly from the GUI
+1. Open the app (`run.bat` or `python app.py`).
+2. In the **Windows Service** strip, click **⚙ Install Service (Start on Boot)**.
+3. Accept the Windows UAC elevation prompt. The service will be installed and started immediately!
+4. Use the **Start Service**, **Stop Service**, and **Uninstall** buttons directly from the GUI.
+
+#### Option 2: Using Batch Scripts (Quick & Easy)
+- **`install_service.bat`** — Installs the Windows Service with `start= auto` (starts on Windows boot) and starts it.
+- **`uninstall_service.bat`** — Stops and removes the Windows Service.
+- **`start_service.bat`** — Starts the Windows Service.
+- **`stop_service.bat`** — Stops the Windows Service.
+- **`service_status.bat`** — Displays current service status, boot startup state, and port.
+
+#### Option 3: Command Line / Python
+```bat
+:: Check service status
+python service_manager.py status
+
+:: Install and enable start on Windows boot
+python service_manager.py install
+
+:: Start / stop / restart
+python service_manager.py start
+python service_manager.py stop
+python service_manager.py restart
+
+:: Uninstall
+python service_manager.py uninstall
+
+:: Run headless directly in console (without Windows Service)
+python service_runner.py
+:: or
+python app.py --headless
+```
+
+---
+
 ## Project files
 
 ```
 desktop-server/
-├── app.py            # the complete application (GUI + HTTP/API server)
-├── requirements.txt  # Python dependencies
-└── README.md         # this file
+├── app.py                 # Full application (CustomTkinter GUI + Flask/Waitress server)
+├── service_runner.py      # Headless runner for Windows Service & CLI
+├── service_manager.py     # Service manager (installation, status, elevation)
+├── AuraWaveService.cs     # Native C# Windows Service source
+├── AuraWaveService.exe    # Compiled Windows Service wrapper (.NET ServiceBase)
+├── config.json            # Persistent server configuration (folder, port, auto_start)
+├── install_service.bat    # 1-click Windows Service installer (starts on boot)
+├── uninstall_service.bat  # 1-click Windows Service uninstaller
+├── start_service.bat      # 1-click service start
+├── stop_service.bat       # 1-click service stop
+├── service_status.bat     # Service status viewer
+├── run.bat                # GUI launcher with virtual environment setup
+├── requirements.txt       # Core Python dependencies
+└── README.md              # Documentation
 ```
 
 ---

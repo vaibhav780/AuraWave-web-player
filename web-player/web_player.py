@@ -496,22 +496,31 @@ def log_scrobble(path, title, artist, album, duration):
 
 
 def get_stats():
-    """Aggregate the local play history into a small dashboard payload."""
+    """Aggregate the local play history into a dashboard payload.
+
+    Beyond the headline totals this now does a little analysis: top albums,
+    plays-per-day for the last two weeks, a 24-hour listening-clock histogram
+    and the first/last play timestamps — enough to see *when* and *what* you
+    listen to, not just how much."""
     out = {"totalPlays": 0, "totalSeconds": 0, "uniqueTracks": 0,
-           "topTracks": [], "topArtists": [], "recent": []}
+           "topTracks": [], "topArtists": [], "topAlbums": [], "recent": [],
+           "perDay": [], "byHour": [0] * 24, "firstPlay": None, "lastPlay": None}
     try:
         with _DB_LOCK, _db() as c:
             r = c.execute(
                 "SELECT COUNT(*) n, COALESCE(SUM(duration),0) s, "
-                "COUNT(DISTINCT path) u FROM scrobbles"
+                "COUNT(DISTINCT path) u, MIN(ts) mn, MAX(ts) mx FROM scrobbles"
             ).fetchone()
             out["totalPlays"] = r["n"] or 0
             out["totalSeconds"] = int(r["s"] or 0)
             out["uniqueTracks"] = r["u"] or 0
+            out["firstPlay"] = r["mn"]
+            out["lastPlay"] = r["mx"]
             out["topTracks"] = [
-                {"title": x["title"], "artist": x["artist"], "plays": x["plays"]}
+                {"title": x["title"], "artist": x["artist"],
+                 "path": x["path"], "plays": x["plays"]}
                 for x in c.execute(
-                    "SELECT title, artist, COUNT(*) plays FROM scrobbles "
+                    "SELECT title, artist, path, COUNT(*) plays FROM scrobbles "
                     "GROUP BY path ORDER BY plays DESC, MAX(ts) DESC LIMIT 20"
                 ).fetchall()
             ]
@@ -523,14 +532,61 @@ def get_stats():
                     "GROUP BY artist ORDER BY plays DESC LIMIT 20"
                 ).fetchall()
             ]
+            out["topAlbums"] = [
+                {"album": x["album"], "plays": x["plays"]}
+                for x in c.execute(
+                    "SELECT album, COUNT(*) plays FROM scrobbles "
+                    "WHERE album IS NOT NULL AND album <> '' "
+                    "GROUP BY album ORDER BY plays DESC LIMIT 20"
+                ).fetchall()
+            ]
             out["recent"] = [
                 {"title": x["title"], "artist": x["artist"], "ts": x["ts"]}
                 for x in c.execute(
                     "SELECT title, artist, ts FROM scrobbles ORDER BY ts DESC LIMIT 30"
                 ).fetchall()
             ]
+            # Plays per local calendar day for the last 14 days (fills gaps with 0).
+            by_day = {}
+            for x in c.execute(
+                "SELECT ts FROM scrobbles WHERE ts >= ?",
+                (time.time() - 14 * 86400,),
+            ).fetchall():
+                day = time.strftime("%Y-%m-%d", time.localtime(x["ts"]))
+                by_day[day] = by_day.get(day, 0) + 1
+            today = time.localtime()
+            base = time.mktime((today.tm_year, today.tm_mon, today.tm_mday,
+                                12, 0, 0, 0, 0, -1))
+            out["perDay"] = [
+                {"date": (d := time.strftime("%Y-%m-%d",
+                          time.localtime(base - i * 86400))), "plays": by_day.get(d, 0)}
+                for i in range(13, -1, -1)
+            ]
+            # Listening clock: plays bucketed by hour-of-day (local time), 0..23.
+            hours = [0] * 24
+            for x in c.execute("SELECT ts FROM scrobbles").fetchall():
+                hours[time.localtime(x["ts"]).tm_hour] += 1
+            out["byHour"] = hours
     except Exception as exc:
         print(f"  [stats] failed: {exc}", file=sys.stderr)
+    return out
+
+
+def get_play_counts():
+    """Return {relative_path: play_count} for every track with history.
+
+    Keyed by the same posix `path` each catalog entry carries, so the client
+    can show a per-song play tally without re-querying per row."""
+    out = {}
+    try:
+        with _DB_LOCK, _db() as c:
+            for x in c.execute(
+                "SELECT path, COUNT(*) n FROM scrobbles "
+                "WHERE path IS NOT NULL AND path <> '' GROUP BY path"
+            ).fetchall():
+                out[x["path"]] = x["n"]
+    except Exception as exc:
+        print(f"  [playcounts] failed: {exc}", file=sys.stderr)
     return out
 
 
@@ -839,6 +895,23 @@ def extract_embedded_art(abs_path: str):
     return None, None
 
 
+def added_time(st):
+    """"Date added to the folder" (unix seconds) for a file's stat result.
+
+    When music is copied into a folder the modification time is usually inherited
+    from the source file, so it does NOT reflect when the track landed here. The
+    creation time does: prefer ``st_birthtime`` (set on Windows/macOS when the file
+    is created in this folder), fall back to Windows' ``st_ctime`` (also creation
+    time there), and only then to the modification time on other platforms.
+    """
+    bt = getattr(st, "st_birthtime", None)
+    if bt:
+        return int(bt)
+    if os.name == "nt":
+        return int(st.st_ctime)  # creation time on Windows
+    return int(st.st_mtime)
+
+
 def scan_music(music_dir: str):
     """Recursively scan `music_dir` for supported audio, returning a list of track dicts.
 
@@ -954,6 +1027,9 @@ def scan_music(music_dir: str):
                     "duration": duration,
                     "format": (ext.lstrip(".") or None),
                     "sizeBytes": size,
+                    # "Date added" to the folder (creation time where available),
+                    # so the client can sort newest-first.
+                    "addedAt": added_time(st) if size is not None else None,
                     "artworkUrl": artwork_url,
                     "year": year,
                     "musicDirector": music_director,
@@ -1780,6 +1856,10 @@ class WebPlayerHandler(BaseHTTPRequestHandler):
                 return
             if path == "/stats":
                 self._send_bytes(json.dumps(get_stats()).encode("utf-8"),
+                                 "application/json; charset=utf-8")
+                return
+            if path == "/playcounts":
+                self._send_bytes(json.dumps(get_play_counts()).encode("utf-8"),
                                  "application/json; charset=utf-8")
                 return
             if path == "/playlists/disk":

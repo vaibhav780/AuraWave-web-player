@@ -48,6 +48,16 @@ if errorlevel 1 (
     exit /b 1
 )
 
+REM --- 3b. Optional: system-tray extras (best-effort, never blocks launch) ----
+REM --only-binary=:all: means pip only uses a prebuilt wheel and never tries to
+REM compile from source, so a missing wheel fails fast instead of hanging. A
+REM failure here is ignored: the app runs fine without the tray.
+echo      ... optional: system-tray support (skipped if no wheel for this Python)
+"%VENV_PY%" -m pip install --disable-pip-version-check -q --only-binary=:all: -r requirements-tray.txt
+if errorlevel 1 (
+    echo      [note] Tray support not installed - the app will close normally on X.
+)
+
 REM --- 4. Launch the application ----------------------------------------------
 echo [3/3] Starting AuraWave Music Server ...
 echo.

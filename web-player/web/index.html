@@ -55,7 +55,7 @@
     <div class="sidebar-footer">
       <button class="ghost-btn" id="btn-autoplay">📻 Autoplay radio: Off</button>
       <button class="ghost-btn" id="btn-qr">📱 Open on phone (QR)</button>
-      <button class="ghost-btn" id="btn-theme">🌓 Toggle theme</button>
+      <button class="ghost-btn" id="btn-theme">🎨 Theme: Emerald</button>
     </div>
   </aside>
   <div class="scrim" id="scrim"></div>
@@ -199,17 +199,58 @@
     <div class="eq-bands" id="eq-bands"></div>
 
     <div class="fx-grid" id="fx-grid">
+      <!-- Quick aesthetic preset modes -->
+      <div class="fx-quick-modes">
+        <span class="fx-group-title">Quick Modes</span>
+        <div class="fx-mode-chips">
+          <button class="chip-btn tiny" id="fx-mode-slowed" title="Slow tempo, vinyl pitch, and hall reverb">🌙 Slowed + Reverb</button>
+          <button class="chip-btn tiny" id="fx-mode-nightcore" title="Sped-up tempo, pitch rise, and crystal clarity">⚡ Nightcore</button>
+        </div>
+      </div>
+
+      <!-- Tone & Clarity Section -->
+      <div class="fx-section-header">
+        <span>Tone &amp; Clarity</span>
+      </div>
       <div class="fx">
-        <label>Reverb</label>
-        <select id="fx-reverb"></select>
+        <label>Treble Clarity (Exciter) <span id="fx-clarity-val">0</span></label>
+        <input type="range" id="fx-clarity" min="0" max="100" value="0">
+      </div>
+      <div class="fx">
+        <label>Vocal Clarity Booster <span id="fx-vocalboost-val">0</span></label>
+        <input type="range" id="fx-vocalboost" min="0" max="100" value="0">
+      </div>
+      <div class="fx">
+        <label>Sub-Bass (45Hz Rumble) <span id="fx-subbass-val">0</span></label>
+        <input type="range" id="fx-subbass" min="0" max="100" value="0">
+      </div>
+      <div class="fx">
+        <label>X-Bass (110Hz Punch) <span id="fx-bass-val">0</span></label>
+        <input type="range" id="fx-bass" min="0" max="100" value="0">
+      </div>
+      <div class="fx">
+        <label>De-Esser (Anti-Sibilance) <span id="fx-deesser-val">0</span></label>
+        <input type="range" id="fx-deesser" min="0" max="100" value="0">
+      </div>
+      <div class="fx">
+        <label class="switch"><input type="checkbox" id="fx-loudnesscomp"><span></span> Loudness EQ (Fletcher-Munson)</label>
+      </div>
+
+      <!-- Spatial & 3D Section -->
+      <div class="fx-section-header">
+        <span>Spatial &amp; 3D Sound</span>
+      </div>
+      <div class="fx">
+        <label>8D Audio (Orbiting) <span id="fx-orbit8d-val">Off</span></label>
+        <input type="range" id="fx-orbit8d" min="0" max="100" value="0">
+      </div>
+      <div class="fx">
+        <label>3D Virtual Surround <span id="fx-surround3d-val">0</span></label>
+        <input type="range" id="fx-surround3d" min="0" max="100" value="0">
       </div>
       <div class="fx">
         <label>Stereo Widen <span id="fx-wide-val">0</span></label>
         <input type="range" id="fx-wide" min="0" max="100" value="0">
-      </div>
-      <div class="fx">
-        <label>X-Bass <span id="fx-bass-val">0</span></label>
-        <input type="range" id="fx-bass" min="0" max="100" value="0">
       </div>
       <div class="fx">
         <label>X-Surround <span id="fx-surround-val">0</span></label>
@@ -218,6 +259,43 @@
       <div class="fx">
         <label>Headphone Crossfeed <span id="fx-crossfeed-val">0</span></label>
         <input type="range" id="fx-crossfeed" min="0" max="100" value="0">
+      </div>
+      <div class="fx">
+        <label>Ping-Pong Echo <span id="fx-echo-val">0</span></label>
+        <input type="range" id="fx-echo" min="0" max="100" value="0">
+      </div>
+      <div class="fx">
+        <label>Echo Delay Time <span id="fx-echotime-val">350ms</span></label>
+        <input type="range" id="fx-echotime" min="100" max="800" step="25" value="350">
+      </div>
+      <div class="fx">
+        <label>Stereo Chorus <span id="fx-chorus-val">0</span></label>
+        <input type="range" id="fx-chorus" min="0" max="100" value="0">
+      </div>
+      <div class="fx">
+        <label>L / R Balance <span id="fx-balance-val">Center</span></label>
+        <input type="range" id="fx-balance" min="-100" max="100" step="2" value="0">
+      </div>
+      <div class="fx">
+        <label class="switch"><input type="checkbox" id="fx-mono"><span></span> Mono downmix</label>
+      </div>
+
+      <!-- Atmosphere & Vintage Section -->
+      <div class="fx-section-header">
+        <span>Atmosphere &amp; Vintage</span>
+      </div>
+      <div class="fx">
+        <label>Reverb Environment</label>
+        <select id="fx-reverb"></select>
+      </div>
+      <div class="fx">
+        <label>Analog / Tape Warmth <span id="fx-warmth-val">0</span></label>
+        <input type="range" id="fx-warmth" min="0" max="100" value="0">
+      </div>
+
+      <!-- Playback & Dynamics Section -->
+      <div class="fx-section-header">
+        <span>Playback &amp; Dynamics</span>
       </div>
       <div class="fx fx-vocal-wrap">
         <label class="switch"><input type="checkbox" id="fx-vocal"><span></span> Remove vocals (instrumental)</label>
@@ -240,8 +318,7 @@
         <input type="range" id="fx-crossfade" min="0" max="12" value="0" step="1">
       </div>
       <div class="fx">
-        <label>3D Surround <span id="fx-surround3d-val">0</span></label>
-        <input type="range" id="fx-surround3d" min="0" max="100" value="0">
+        <label class="switch"><input type="checkbox" id="fx-nightmode"><span></span> Night mode (soft peaks)</label>
       </div>
       <div class="fx">
         <label class="switch"><input type="checkbox" id="fx-normalize"><span></span> Normalize volume</label>
@@ -327,6 +404,18 @@
         <button class="ghost-btn" id="tag-cancel">Cancel</button>
         <button class="primary-btn" id="tag-save">Save</button>
       </div>
+    </div>
+  </div>
+
+  <!-- Theme Picker modal -->
+  <div class="modal-scrim" id="theme-scrim" hidden>
+    <div class="modal theme-modal" id="theme-modal">
+      <div class="panel-head">
+        <h3 style="margin:0;">Theme & Colors</h3>
+        <button class="icon-btn small" id="theme-cancel" title="Close">✕</button>
+      </div>
+      <p style="margin:4px 0 16px; color:var(--text-dim); font-size:13px;">Choose your visual aesthetic and accent colors.</p>
+      <div class="theme-grid" id="theme-grid"></div>
     </div>
   </div>
 

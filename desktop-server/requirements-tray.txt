@@ -1,0 +1,12 @@
+# Optional dependencies for the "minimize to system tray" feature.
+#
+# Installed best-effort by run.bat with --only-binary so pip only ever uses a
+# prebuilt wheel (no slow/fragile source builds). Intentionally UNPINNED so each
+# Python version picks a wheel that supports it — pinning Pillow to an exact
+# version breaks on newer Pythons that only have wheels for a later Pillow.
+#
+# If no compatible wheel exists for your Python yet (can happen right after a new
+# Python release), the install is simply skipped and the app runs without the
+# tray. Using Python 3.11–3.13 for the venv is the safest bet for tray support.
+pystray
+Pillow

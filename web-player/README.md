@@ -88,14 +88,19 @@ what's active at `GET /capabilities` and in the startup banner.
   sitting in your music folder (`GET /playlists/disk`), and export any web playlist
   back to disk as a portable `.m3u` sidecar (`POST /playlists/export`).
 - **Local scrobbling & stats.** Every play is logged to the SQLite DB; a **Stats**
-  view shows total plays, listening time, and your top tracks/artists
-  (`POST /scrobble`, `GET /stats`). Optional Last.fm push with
+  view shows total plays, listening time, average plays per track, your top
+  tracks / artists / albums, a **plays-per-day** bar chart (last 14 days) and a
+  **listening clock** histogram by hour of day (`POST /scrobble`, `GET /stats`).
+  Each song row also carries a **per-song play counter** (`▶ N`) fed by
+  `GET /playcounts` (a `{path: count}` map), updated live as you listen. Optional Last.fm push with
   `--lastfm-key/--lastfm-secret/--lastfm-session` (a pre-obtained session key;
   local history is always the primary store).
-- **Audiophile effects (client-side, Web Audio):** **headphone crossfeed**
-  (BS2B-style channel blending for natural headphone listening) and a
-  **parametric EQ** mode (adjustable frequency / Q / shelving per band) layered on
-  top of the existing 10-band graphic EQ, reverb, widen, X-Bass and X-Surround.
+- **Audiophile & creative effects (client-side, Web Audio API):**
+  - **Tone & Clarity:** Treble Crystalizer (exciter), Vocal Clarity Booster, Sub-Bass (45Hz deep punch), X-Bass (110Hz punch), De-Esser (sibilance tamer), and Fletcher-Munson dynamic loudness compensation.
+  - **Spatial & 3D Sound:** 8D Audio (dynamic 360° binaural orbit around listener), 3D Virtual Surround (HRTF), Stereo Widen (M/S + Haas), X-Surround, Headphone Crossfeed (BS2B-style), Ping-Pong Stereo Echo / Delay, Stereo Chorus shimmer, L/R Balance, and Mono downmix.
+  - **Atmosphere & Vintage:** 7 Reverb environments (Room, Hall, Stadium, Cathedral, Plate, Cave), Analog / Tape Warmth (Lo-Fi soft saturation).
+  - **Quick Modes:** 1-click **Slowed + Reverb** and **Nightcore** modes.
+  - **Dynamics & Protection:** Night Mode (late-night peak leveling), Loudness Normalizer, and Safety Limiter (anti-clip).
 
 Optional dependencies live in **`requirements-optional.txt`**
 (`pip install -r requirements-optional.txt` for `mutagen` + `watchdog`). SQLite
