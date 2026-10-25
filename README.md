@@ -125,19 +125,36 @@ by scanning the update server's "FIRST INSTALL" QR, then stream from either serv
 
 ## 📸 Screenshots
 
-> _Add your own screenshots here!_ Drop images into a `docs/` folder and reference them, e.g.:
->
-> ```md
-> ![Library](docs/library.png)
-> ![Now Playing + EQ](docs/equalizer.png)
-> ![Stats](docs/stats.png)
-> ```
-
 <div align="center">
 
-| Library | Equalizer | Stats |
+### 🎵 Library & Music Catalog
+*Browse your entire collection with Date Added sorting, grouping by Artist/Album/Year/Director, instant search, and Emerald Aura theme.*
+
+<img src="docs/library.png" alt="AuraWave Library View" width="100%" />
+
+<br/><br/>
+
+### 💿 High-Resolution Album Grid
+*Grid view featuring dynamic album art caching, track counts, and responsive fluid layout.*
+
+<img src="docs/albums.png" alt="AuraWave Albums View" width="100%" />
+
+<br/><br/>
+
+### 🎤 Now Playing, Synced Lyrics & Live Visualizer
+*Karaoke-style synchronized lyrics highlighting with real-time multi-style audio spectrum visualizer.*
+
+<img src="docs/now_playing_lyrics.png" alt="AuraWave Now Playing with Synced Lyrics and Visualizer" width="100%" />
+
+<br/><br/>
+
+### 🎛️ Audiophile Sound Studio & Web Audio DSP Engine
+*Complete client-side 32-bit float audio processing pipeline running in real-time in your browser.*
+
+| 10-Band Graphic & Parametric EQ | Spatial, 3D & Tone Enhancements | Atmosphere & Dynamics |
 |:---:|:---:|:---:|
-| _coming soon_ | _coming soon_ | _coming soon_ |
+| <img src="docs/equalizer.png" width="100%" alt="10-Band Equalizer" /> | <img src="docs/effects_spatial_tone.png" width="100%" alt="Spatial and Tone Effects" /> | <img src="docs/effects_dynamics_reverb.png" width="100%" alt="Dynamics and Reverb Effects" /> |
+| **10-Band EQ & Presets**<br/>Genre presets *(Rock, Pop, Jazz, Bass)* + custom frequency tuning | **Spatial & 3D Engine**<br/>8D Audio Orbit, 3D Surround, Headphone Crossfeed, Ping-Pong Echo, Sub-Bass & Clarity Booster | **Atmosphere & Dynamics**<br/>7 Convolver Reverbs, Analog Tape Warmth, Real-time Vocal Removal, Slowed+Reverb & Nightcore |
 
 </div>
 

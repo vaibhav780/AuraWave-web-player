@@ -31,6 +31,10 @@ Then open the printed URL in a browser:
         >>>  http://<your-lan-ip>:8000/  <<<
 ```
 
+<div align="center">
+  <img src="../docs/library.png" alt="AuraWave Web Player Interface" width="100%" />
+</div>
+
 - On a phone: open `http://<lan-ip>:8000/qr` on the PC and scan the QR code, or
   just type the URL. Both devices must be on the same Wi-Fi.
 - `run.bat` automatically prefers the `desktop-server/.venv` Python if it exists
