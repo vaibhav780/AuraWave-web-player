@@ -154,7 +154,7 @@ by scanning the update server's "FIRST INSTALL" QR, then stream from either serv
 | 10-Band Graphic & Parametric EQ | Spatial, 3D & Tone Enhancements | Atmosphere & Dynamics |
 |:---:|:---:|:---:|
 | <img src="docs/equalizer.png" width="100%" alt="10-Band Equalizer" /> | <img src="docs/effects_spatial_tone.png" width="100%" alt="Spatial and Tone Effects" /> | <img src="docs/effects_dynamics_reverb.png" width="100%" alt="Dynamics and Reverb Effects" /> |
-| **10-Band EQ & Presets**<br/>Genre presets *(Rock, Pop, Jazz, Bass)* + custom frequency tuning | **Spatial & 3D Engine**<br/>8D Audio Orbit, 3D Surround, Headphone Crossfeed, Ping-Pong Echo, Sub-Bass & Clarity Booster | **Atmosphere & Dynamics**<br/>7 Convolver Reverbs, Analog Tape Warmth, Real-time Vocal Removal, Slowed+Reverb & Nightcore |
+| **10-Band EQ & Presets**<br/>Genre presets *(Rock, Pop, Jazz, Bass)* + custom frequency tuning | **Spatial & 3D Engine**<br/>8D Audio Orbit, 3D Surround, Headphone Crossfeed, Ping-Pong Echo, Sub-Bass & Clarity Booster | **Atmosphere & Dynamics**<br/>7 Convolver Reverbs, Analog Warmth, Lo-Fi Cassette Filter, Slowed+Reverb, Nightcore & Lo-Fi Chill |
 
 </div>
 

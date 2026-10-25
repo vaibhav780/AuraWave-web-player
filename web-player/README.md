@@ -102,8 +102,8 @@ what's active at `GET /capabilities` and in the startup banner.
 - **Audiophile & creative effects (client-side, Web Audio API):**
   - **Tone & Clarity:** Treble Crystalizer (exciter), Vocal Clarity Booster, Sub-Bass (45Hz deep punch), X-Bass (110Hz punch), De-Esser (sibilance tamer), and Fletcher-Munson dynamic loudness compensation.
   - **Spatial & 3D Sound:** 8D Audio (dynamic 360° binaural orbit around listener), 3D Virtual Surround (HRTF), Stereo Widen (M/S + Haas), X-Surround, Headphone Crossfeed (BS2B-style), Ping-Pong Stereo Echo / Delay, Stereo Chorus shimmer, L/R Balance, and Mono downmix.
-  - **Atmosphere & Vintage:** 7 Reverb environments (Room, Hall, Stadium, Cathedral, Plate, Cave), Analog / Tape Warmth (Lo-Fi soft saturation).
-  - **Quick Modes:** 1-click **Slowed + Reverb** and **Nightcore** modes.
+  - **Atmosphere & Vintage:** 7 Reverb environments (Room, Hall, Stadium, Cathedral, Plate, Cave), Analog / Tape Warmth, Lo-Fi / Cassette Filter.
+  - **Quick Modes:** 1-click **Slowed + Reverb**, **Nightcore**, and **☕ Lo-Fi Chill** modes.
   - **Dynamics & Protection:** Night Mode (late-night peak leveling), Loudness Normalizer, and Safety Limiter (anti-clip).
 
 Optional dependencies live in **`requirements-optional.txt`**

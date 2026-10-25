@@ -82,10 +82,12 @@ Audio Source (<audio> tag / MediaElementSourceNode)
   │     └── Ping-Pong Stereo Echo (alternating L/R delay lines)
   ├── Atmosphere:
   │     ├── 7 Convolver Reverb Environments (Room, Hall, Stadium, Cathedral, Plate, Cave)
-  │     └── Analog / Tape Warmth (soft-clipping Waveshaper)
+  │     ├── Analog / Tape Warmth (soft-clipping Waveshaper)
+  │     └── Lo-Fi / Cassette Filter (vintage bandpass & head resonance)
   ├── Creative Quick Modes:
   │     ├── Slowed + Reverb (0.85× playback speed, pitch drop, lush reverb)
-  │     └── Nightcore (1.25× speed & pitch boost)
+  │     ├── Nightcore (1.25× speed & pitch boost)
+  │     └── Lo-Fi Chill (0.92× speed, cassette bandpass, tape warmth & room ambience)
   ├── Dynamics & Safety:
   │     ├── Night Mode (soft peak leveling via DynamicsCompressorNode)
   │     ├── Loudness Normalizer (Fletcher-Munson equal-loudness curve)
@@ -122,7 +124,7 @@ The folder `D:\Tech\Music Streamer` contains significant architectural evolution
 
 ### D. Audio & PWA Upgrades (`web-player`)
 - **Service Worker (`web/sw.js`)**: Added PWA Service Worker to host the "Now Playing" lockscreen notification and handle media button actions (Prev/Next/Play/Pause) across mobile and desktop browsers.
-- **Quick Audio Presets**: 1-click buttons for **Slowed + Reverb** and **Nightcore**.
+- **Quick Audio Presets**: 1-click buttons for **Slowed + Reverb**, **Nightcore**, and **Lo-Fi Chill**.
 - **Ping-Pong Stereo Echo**: Configurable echo depth and delay time (ms).
 - **Night Mode**: Dynamic peak compression to avoid sudden volume spikes during late-night listening.
 - **Theme Customizer**: Replaced simple theme toggle with an aesthetic Theme Picker modal featuring multiple accent palettes (Emerald, Violet, Cyberpunk, Obsidian, etc.).

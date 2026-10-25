@@ -193,6 +193,7 @@
       subBass: 0,        // 0..100 Sub-bass Resonator (45 Hz deep punch)
       deEsser: 0,        // 0..100 De-Esser (6.5 kHz sibilance reducer)
       warmth: 0,         // 0..100 Analog / Tape Warmth (soft saturation + vintage roll-off)
+      lofi: 0,           // 0..100 Lo-Fi / Cassette Filter (vintage bandpass & head resonance)
       echo: 0,           // 0..100 Ping-Pong Delay / Stereo Echo wet mix
       echoTime: 350,     // 100..800 ms Delay Time
       orbit8d: 0,        // 0..100 8D Audio Binaural Orbit (0 = off, 1..100 speed)
@@ -219,6 +220,7 @@
   if (state.eq.subBass == null) state.eq.subBass = 0;
   if (state.eq.deEsser == null) state.eq.deEsser = 0;
   if (state.eq.warmth == null) state.eq.warmth = 0;
+  if (state.eq.lofi == null) state.eq.lofi = 0;
   if (state.eq.echo == null) state.eq.echo = 0;
   if (state.eq.echoTime == null) state.eq.echoTime = 350;
   if (state.eq.orbit8d == null) state.eq.orbit8d = 0;
@@ -272,6 +274,7 @@
   let deEsserNode = null;                    // 6.5kHz sibilance tamer
   let clarityNode = null;                    // 9.5kHz treble exciter
   let lofiDryGain = null, lofiWetGain = null, lofiShaper = null, lofiLp = null, lofiHp = null;
+  let cassHpNode = null, cassLpNode = null, cassPeakNode = null;
   let echoDelayL = null, echoDelayR = null, echoFbL = null, echoFbR = null, echoWet = null;
   let chorusDelayL = null, chorusDelayR = null, chorusWet = null;
   let orbitPanner = null, orbitWet = null, orbitRaf = null, orbitAngle = 0, orbitLastTime = 0;
@@ -391,6 +394,11 @@
       const lfHp = ctx.createBiquadFilter(); lfHp.type = "highpass"; lfHp.frequency.value = 20;
       const lfOut = ctx.createGain();
 
+      // Cassette bandpass & head resonance for Lo-Fi filter
+      const cassHp = ctx.createBiquadFilter(); cassHp.type = "highpass"; cassHp.frequency.value = 20;
+      const cassLp = ctx.createBiquadFilter(); cassLp.type = "lowpass"; cassLp.frequency.value = 20000;
+      const cassPeak = ctx.createBiquadFilter(); cassPeak.type = "peaking"; cassPeak.frequency.value = 1800; cassPeak.Q.value = 1.0; cassPeak.gain.value = 0;
+
       // --- Vocal removal (centre-channel cancellation) -------------------
       // Classic "karaoke" matrix: outL = L - s·R, outR = R - s·L. Content panned
       // dead-centre (usually the lead vocal) is equal in both channels, so the
@@ -426,7 +434,7 @@
       const splitter = ctx.createChannelSplitter(2);
       const merger = ctx.createChannelMerger(2);
       const gLL = ctx.createGain(), gRL = ctx.createGain(), gLR = ctx.createGain(), gRR = ctx.createGain();
-      lfOut.connect(splitter);
+      lfOut.connect(cassHp).connect(cassLp).connect(cassPeak).connect(splitter);
       splitter.connect(gLL, 0); splitter.connect(gLR, 0); // L
       splitter.connect(gRL, 1); splitter.connect(gRR, 1); // R
       gLL.connect(merger, 0, 0); gRL.connect(merger, 0, 0); // -> left
@@ -589,6 +597,7 @@
       ac = ctx; srcNode = src; eqNodes = eq; xbass = bass;
       subBassNode = subB; vocalBoostNode = vBoost; deEsserNode = deEss; clarityNode = clr;
       lofiDryGain = lfDry; lofiWetGain = lfWet; lofiShaper = lfShaper; lofiLp = lfLp; lofiHp = lfHp;
+      cassHpNode = cassHp; cassLpNode = cassLp; cassPeakNode = cassPeak;
       echoDelayL = eDelayL; echoDelayR = eDelayR; echoFbL = eFbL; echoFbR = eFbR; echoWet = eWet;
       chorusDelayL = cDelayL; chorusDelayR = cDelayR; chorusWet = cWet;
       orbitPanner = p8d; orbitWet = o8Wet;
@@ -708,7 +717,7 @@
 
     // Lo-Fi / Analog Warmth
     if (lofiDryGain && lofiWetGain) {
-      const w = (e.warmth || 0) / 100;
+      const w = bypassAll ? 0 : (e.warmth || 0) / 100;
       if (w > 0) {
         lofiDryGain.gain.value = 1 - w * 0.45;
         lofiWetGain.gain.value = w * 0.85;
@@ -720,6 +729,20 @@
         lofiWetGain.gain.value = 0;
         lofiLp.frequency.value = 20000;
         lofiHp.frequency.value = 20;
+      }
+    }
+
+    // Lo-Fi / Cassette Bandpass Filter
+    if (cassHpNode && cassLpNode && cassPeakNode) {
+      const lf = bypassAll ? 0 : (e.lofi || 0) / 100;
+      if (lf > 0) {
+        cassHpNode.frequency.value = 20 + lf * 340;       // 20Hz -> 360Hz low cut
+        cassLpNode.frequency.value = 20000 - lf * 16200;  // 20kHz -> 3.8kHz vintage warmth cut
+        cassPeakNode.gain.value = lf * 3.5;               // subtle cassette head resonance (+3.5 dB)
+      } else {
+        cassHpNode.frequency.value = 20;
+        cassLpNode.frequency.value = 20000;
+        cassPeakNode.gain.value = 0;
       }
     }
 
@@ -852,6 +875,9 @@
     if (deEsserNode) deEsserNode.gain.value = 0;
     if (clarityNode) clarityNode.gain.value = 0;
     if (lofiDryGain) { lofiDryGain.gain.value = 1; lofiWetGain.gain.value = 0; }
+    if (cassHpNode) cassHpNode.frequency.value = 20;
+    if (cassLpNode) cassLpNode.frequency.value = 20000;
+    if (cassPeakNode) cassPeakNode.gain.value = 0;
     if (widenGLL) { widenGLL.gain.value = 1; widenGRL.gain.value = 0; widenGLR.gain.value = 0; widenGRR.gain.value = 1; }
     if (widenWet) widenWet.gain.value = 0;
     if (reverbWet) reverbWet.gain.value = 0;
@@ -2830,12 +2856,15 @@
     }
     if ($("#fx-mono")) $("#fx-mono").checked = state.eq.mono;
     if ($("#fx-warmth")) { $("#fx-warmth").value = state.eq.warmth; $("#fx-warmth-val").textContent = state.eq.warmth; }
+    if ($("#fx-lofi")) { $("#fx-lofi").value = state.eq.lofi; $("#fx-lofi-val").textContent = state.eq.lofi; }
     if ($("#fx-nightmode")) $("#fx-nightmode").checked = state.eq.nightMode;
 
     const isSlowed = state.eq.speed === 0.85 && !state.eq.pitch && state.eq.reverb === "HALL";
     if ($("#fx-mode-slowed")) $("#fx-mode-slowed").classList.toggle("active", isSlowed);
     const isNightcore = state.eq.speed === 1.25 && !state.eq.pitch && state.eq.clarity >= 30;
     if ($("#fx-mode-nightcore")) $("#fx-mode-nightcore").classList.toggle("active", isNightcore);
+    const isLoFi = state.eq.speed === 0.92 && !state.eq.pitch && state.eq.lofi >= 40;
+    if ($("#fx-mode-lofi")) $("#fx-mode-lofi").classList.toggle("active", isLoFi);
 
     syncStemUi();
   }
@@ -3569,6 +3598,7 @@
     });
     if ($("#fx-mono")) $("#fx-mono").addEventListener("change", (e) => { state.eq.mono = e.target.checked; persistEq(); applyEffects(); });
     fxBind("#fx-warmth", "warmth", "#fx-warmth-val");
+    fxBind("#fx-lofi", "lofi", "#fx-lofi-val");
     if ($("#fx-nightmode")) $("#fx-nightmode").addEventListener("change", (e) => { state.eq.nightMode = e.target.checked; persistEq(); applyEffects(); });
 
     if ($("#fx-mode-slowed")) $("#fx-mode-slowed").addEventListener("click", () => {
@@ -3591,8 +3621,22 @@
         state.eq.speed = 1.0; state.eq.pitch = true; state.eq.clarity = 0; state.eq.subBass = 0;
         toast("Nightcore mode turned off");
       } else {
-        state.eq.speed = 1.25; state.eq.pitch = false; state.eq.clarity = 40; state.eq.subBass = 20;
+        state.eq.speed = 1.25; state.eq.pitch = false; state.eq.clarity = 40; state.eq.subBass = 20; state.eq.lofi = 0;
         toast("⚡ Nightcore mode enabled");
+      }
+      persistEq(); buildEqPanel(); applyEffects();
+    });
+
+    if ($("#fx-mode-lofi")) $("#fx-mode-lofi").addEventListener("click", () => {
+      const isLoFi = state.eq.speed === 0.92 && !state.eq.pitch && state.eq.lofi >= 40;
+      if (isLoFi) {
+        state.eq.speed = 1.0; state.eq.pitch = true; state.eq.lofi = 0; state.eq.warmth = 0;
+        state.eq.reverb = "OFF"; state.eq.subBass = 0;
+        toast("Lo-Fi Chill mode turned off");
+      } else {
+        state.eq.speed = 0.92; state.eq.pitch = false; state.eq.lofi = 60; state.eq.warmth = 40;
+        state.eq.reverb = "ROOM"; state.eq.subBass = 15; state.eq.clarity = 0;
+        toast("☕ Lo-Fi Chill enabled");
       }
       persistEq(); buildEqPanel(); applyEffects();
     });
@@ -3631,7 +3675,7 @@
         vocalRemove: false, vocalStrength: 100, vocalMode: "client",
         limiter: true, surround3d: 0, eqMode: "graphic",
         clarity: 0, vocalBoost: 0, subBass: 0, deEsser: 0,
-        warmth: 0, echo: 0, echoTime: 350, chorus: 0, orbit8d: 0,
+        warmth: 0, lofi: 0, echo: 0, echoTime: 350, chorus: 0, orbit8d: 0,
         balance: 0, mono: false, nightMode: false, loudnessComp: false,
         eqParam: EQ_FREQS.map((f, i) => ({
           type: i === 0 ? "lowshelf" : i === EQ_FREQS.length - 1 ? "highshelf" : "peaking",
