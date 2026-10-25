@@ -194,6 +194,10 @@
       deEsser: 0,        // 0..100 De-Esser (6.5 kHz sibilance reducer)
       warmth: 0,         // 0..100 Analog / Tape Warmth (soft saturation + vintage roll-off)
       lofi: 0,           // 0..100 Lo-Fi / Cassette Filter (vintage bandpass & head resonance)
+      exciter: 0,        // 0..100 Harmonic Exciter (upper-mid harmonic presence / air)
+      phaser: 0,         // 0..100 Phaser (4-stage all-pass sweep)
+      phaserRate: 5,     // 1..40 (×0.1 Hz) Phaser LFO speed
+      bassComp: 0,       // 0..100 Bass Compressor (multiband low-frequency compression)
       echo: 0,           // 0..100 Ping-Pong Delay / Stereo Echo wet mix
       echoTime: 350,     // 100..800 ms Delay Time
       orbit8d: 0,        // 0..100 8D Audio Binaural Orbit (0 = off, 1..100 speed)
@@ -221,6 +225,10 @@
   if (state.eq.deEsser == null) state.eq.deEsser = 0;
   if (state.eq.warmth == null) state.eq.warmth = 0;
   if (state.eq.lofi == null) state.eq.lofi = 0;
+  if (state.eq.exciter == null) state.eq.exciter = 0;
+  if (state.eq.phaser == null) state.eq.phaser = 0;
+  if (state.eq.phaserRate == null) state.eq.phaserRate = 5;
+  if (state.eq.bassComp == null) state.eq.bassComp = 0;
   if (state.eq.echo == null) state.eq.echo = 0;
   if (state.eq.echoTime == null) state.eq.echoTime = 350;
   if (state.eq.orbit8d == null) state.eq.orbit8d = 0;
@@ -275,6 +283,10 @@
   let clarityNode = null;                    // 9.5kHz treble exciter
   let lofiDryGain = null, lofiWetGain = null, lofiShaper = null, lofiLp = null, lofiHp = null;
   let cassHpNode = null, cassLpNode = null, cassPeakNode = null;
+  let exHpNode = null, exShaperNode = null, exLpNode = null, exWetNode = null;  // Harmonic Exciter
+  let phaserLfoNode = null, phaserLfoGainNode = null, phaserWetNode = null;     // Phaser
+  let phaserApfNodes = [];
+  let bcDryGainNode = null, bcWetLowNode = null, bcWetHighNode = null, bcMakeupNode = null; // Bass Compressor
   let echoDelayL = null, echoDelayR = null, echoFbL = null, echoFbR = null, echoWet = null;
   let chorusDelayL = null, chorusDelayR = null, chorusWet = null;
   let orbitPanner = null, orbitWet = null, orbitRaf = null, orbitAngle = 0, orbitLastTime = 0;
@@ -421,13 +433,38 @@
       for (const n of eq) { prev.connect(n); prev = n; }
       prev.connect(subB);
       subB.connect(bass);
-      bass.connect(vBoost);
+      // Bass Compressor — multiband: LP band gets compressed, HP band passes through.
+      // Parallel dry/wet: dry=1/wet=0 at bassComp=0 (transparent), crossfade to wet at 100.
+      const bcLp = ctx.createBiquadFilter(); bcLp.type = "lowpass";  bcLp.frequency.value = 250; bcLp.Q.value = 0.7;
+      const bcHpFilter = ctx.createBiquadFilter(); bcHpFilter.type = "highpass"; bcHpFilter.frequency.value = 250; bcHpFilter.Q.value = 0.7;
+      const bcComp = ctx.createDynamicsCompressor();
+      bcComp.threshold.value = -24; bcComp.knee.value = 12; bcComp.ratio.value = 6;
+      bcComp.attack.value = 0.003; bcComp.release.value = 0.2;
+      const bcMakeup = ctx.createGain(); bcMakeup.gain.value = 1;
+      const bcWetLow = ctx.createGain(); bcWetLow.gain.value = 0;   // compressed low band
+      const bcWetHigh = ctx.createGain(); bcWetHigh.gain.value = 0; // uncompressed high band
+      const bcDry = ctx.createGain(); bcDry.gain.value = 1;         // full dry bypass
+      const bcOut = ctx.createGain();
+      bass.connect(bcDry).connect(bcOut);
+      bass.connect(bcLp).connect(bcComp).connect(bcMakeup).connect(bcWetLow).connect(bcOut);
+      bass.connect(bcHpFilter).connect(bcWetHigh).connect(bcOut);
+      bcOut.connect(vBoost);
       vBoost.connect(deEss);
       deEss.connect(clr);
 
       // Lo-Fi parallel dry/wet
       clr.connect(lfDry).connect(lfOut);
       clr.connect(lfShaper).connect(lfHp).connect(lfLp).connect(lfWet).connect(lfOut);
+
+      // Harmonic Exciter — high-pass → soft-saturate (adds even-order harmonics in upper mids) → mix.
+      // Operating on HP-filtered signal means the harmonics land in "presence / air" region, not warmth.
+      const exHp = ctx.createBiquadFilter(); exHp.type = "highpass"; exHp.frequency.value = 2500;
+      const exShaper = ctx.createWaveShaper();
+      try { exShaper.oversample = "4x"; } catch {}
+      exShaper.curve = makeWarmthCurve(0);
+      const exLp = ctx.createBiquadFilter(); exLp.type = "lowpass"; exLp.frequency.value = 10000;
+      const exWet = ctx.createGain(); exWet.gain.value = 0;
+      clr.connect(exHp).connect(exShaper).connect(exLp).connect(exWet).connect(lfOut);
 
       // --- Stereo-widen mid/side matrix ----------------------------------
       // outL = 0.5(1+w)L + 0.5(1-w)R ; outR = 0.5(1-w)L + 0.5(1+w)R
@@ -499,6 +536,23 @@
       cDelayL.connect(cMerge, 0, 0); cDelayR.connect(cMerge, 0, 1);
       cMerge.connect(cWet);
 
+      // 4-Stage All-Pass Phaser — LFO modulates all-pass filter center frequencies,
+      // creating a sweeping comb-filter / phase-cancellation effect.
+      const phApfFreqs = [500, 1500, 3000, 5000];
+      const phApf = phApfFreqs.map(freq => {
+        const f = ctx.createBiquadFilter(); f.type = "allpass"; f.frequency.value = freq; f.Q.value = 1.0;
+        return f;
+      });
+      const phLfo = ctx.createOscillator(); phLfo.type = "sine"; phLfo.frequency.value = 0.5;
+      const phLfoGain = ctx.createGain(); phLfoGain.gain.value = 0;
+      phLfo.connect(phLfoGain);
+      phApf.forEach(apf => phLfoGain.connect(apf.frequency)); // LFO sweeps all stages
+      merger.connect(phApf[0]);
+      for (let i = 0; i < phApf.length - 1; i++) phApf[i].connect(phApf[i + 1]);
+      const phWet = ctx.createGain(); phWet.gain.value = 0;
+      phApf[phApf.length - 1].connect(phWet);
+      try { phLfo.start(); } catch {}
+
       const master = ctx.createGain();
       merger.connect(dry).connect(master);
       merger.connect(conv).connect(rWet).connect(master);
@@ -506,6 +560,7 @@
       wWet.connect(master);
       eWet.connect(master);
       cWet.connect(master);
+      phWet.connect(master);
 
       // --- Headphone crossfeed (BS2B-style) ------------------------------
       // Blend a little of each channel into the other, short-delayed + low-passed,
@@ -598,6 +653,9 @@
       subBassNode = subB; vocalBoostNode = vBoost; deEsserNode = deEss; clarityNode = clr;
       lofiDryGain = lfDry; lofiWetGain = lfWet; lofiShaper = lfShaper; lofiLp = lfLp; lofiHp = lfHp;
       cassHpNode = cassHp; cassLpNode = cassLp; cassPeakNode = cassPeak;
+      exHpNode = exHp; exShaperNode = exShaper; exLpNode = exLp; exWetNode = exWet;
+      phaserLfoNode = phLfo; phaserLfoGainNode = phLfoGain; phaserWetNode = phWet; phaserApfNodes = phApf;
+      bcDryGainNode = bcDry; bcWetLowNode = bcWetLow; bcWetHighNode = bcWetHigh; bcMakeupNode = bcMakeup;
       echoDelayL = eDelayL; echoDelayR = eDelayR; echoFbL = eFbL; echoFbR = eFbR; echoWet = eWet;
       chorusDelayL = cDelayL; chorusDelayR = cDelayR; chorusWet = cWet;
       orbitPanner = p8d; orbitWet = o8Wet;
@@ -746,6 +804,35 @@
       }
     }
 
+    // Harmonic Exciter: generates upper-mid presence on high-passed signal
+    if (exWetNode && exShaperNode) {
+      const ex = bypassAll ? 0 : (e.exciter || 0) / 100;
+      if (ex > 0) {
+        exWetNode.gain.value = ex * 0.45;
+        exShaperNode.curve = makeWarmthCurve(ex * 0.8); // reuse warmth curve on HP signal = "air"
+      } else {
+        exWetNode.gain.value = 0;
+      }
+    }
+
+    // Bass Compressor: parallel multiband — crossfade dry ↔ (compressed low + uncompressed high)
+    if (bcDryGainNode && bcWetLowNode && bcWetHighNode) {
+      const bc = bypassAll ? 0 : (e.bassComp || 0) / 100;
+      bcDryGainNode.gain.value  = 1 - bc;
+      bcWetLowNode.gain.value   = bc;
+      bcWetHighNode.gain.value  = bc;
+      if (bcMakeupNode) bcMakeupNode.gain.value = 1 + bc * 0.45; // subtle makeup gain
+    }
+
+    // Phaser: 4-stage all-pass sweep
+    if (phaserWetNode && phaserLfoGainNode && phaserLfoNode) {
+      const ph = bypassAll ? 0 : (e.phaser || 0) / 100;
+      phaserWetNode.gain.value    = ph * 0.5;
+      phaserLfoGainNode.gain.value = ph * 1400;                        // LFO depth in Hz
+      phaserLfoNode.frequency.value = Math.max(0.1, ((e.phaserRate || 5) / 10)); // 0.1..4.0 Hz
+      if (phaserApfNodes.length) phaserApfNodes.forEach(apf => { apf.Q.value = 0.5 + ph * 4; });
+    }
+
     // Headphone crossfeed: 0..100 -> 0..~0.5 cross-channel wet level.
     if (cfCrossL && cfCrossR) {
       const cf = (e.crossfeed || 0) / 100 * 0.5;
@@ -878,6 +965,10 @@
     if (cassHpNode) cassHpNode.frequency.value = 20;
     if (cassLpNode) cassLpNode.frequency.value = 20000;
     if (cassPeakNode) cassPeakNode.gain.value = 0;
+    if (exWetNode) exWetNode.gain.value = 0;
+    if (phaserWetNode) phaserWetNode.gain.value = 0;
+    if (phaserLfoGainNode) phaserLfoGainNode.gain.value = 0;
+    if (bcDryGainNode) { bcDryGainNode.gain.value = 1; bcWetLowNode.gain.value = 0; bcWetHighNode.gain.value = 0; }
     if (widenGLL) { widenGLL.gain.value = 1; widenGRL.gain.value = 0; widenGLR.gain.value = 0; widenGRR.gain.value = 1; }
     if (widenWet) widenWet.gain.value = 0;
     if (reverbWet) reverbWet.gain.value = 0;
@@ -2857,6 +2948,10 @@
     if ($("#fx-mono")) $("#fx-mono").checked = state.eq.mono;
     if ($("#fx-warmth")) { $("#fx-warmth").value = state.eq.warmth; $("#fx-warmth-val").textContent = state.eq.warmth; }
     if ($("#fx-lofi")) { $("#fx-lofi").value = state.eq.lofi; $("#fx-lofi-val").textContent = state.eq.lofi; }
+    if ($("#fx-exciter")) { $("#fx-exciter").value = state.eq.exciter; $("#fx-exciter-val").textContent = state.eq.exciter; }
+    if ($("#fx-phaser")) { $("#fx-phaser").value = state.eq.phaser; $("#fx-phaser-val").textContent = state.eq.phaser; }
+    if ($("#fx-phaserrate")) { $("#fx-phaserrate").value = state.eq.phaserRate; $("#fx-phaserrate-val").textContent = (state.eq.phaserRate / 10).toFixed(1) + " Hz"; }
+    if ($("#fx-basscomp")) { $("#fx-basscomp").value = state.eq.bassComp; $("#fx-basscomp-val").textContent = state.eq.bassComp; }
     if ($("#fx-nightmode")) $("#fx-nightmode").checked = state.eq.nightMode;
 
     const isSlowed = state.eq.speed === 0.85 && !state.eq.pitch && state.eq.reverb === "HALL";
@@ -3599,6 +3694,14 @@
     if ($("#fx-mono")) $("#fx-mono").addEventListener("change", (e) => { state.eq.mono = e.target.checked; persistEq(); applyEffects(); });
     fxBind("#fx-warmth", "warmth", "#fx-warmth-val");
     fxBind("#fx-lofi", "lofi", "#fx-lofi-val");
+    fxBind("#fx-exciter", "exciter", "#fx-exciter-val");
+    fxBind("#fx-phaser", "phaser", "#fx-phaser-val");
+    fxBind("#fx-basscomp", "bassComp", "#fx-basscomp-val");
+    if ($("#fx-phaserrate")) $("#fx-phaserrate").addEventListener("input", (ev) => {
+      state.eq.phaserRate = Number(ev.target.value);
+      if ($("#fx-phaserrate-val")) $("#fx-phaserrate-val").textContent = (state.eq.phaserRate / 10).toFixed(1) + " Hz";
+      persistEq(); applyEffects();
+    });
     if ($("#fx-nightmode")) $("#fx-nightmode").addEventListener("change", (e) => { state.eq.nightMode = e.target.checked; persistEq(); applyEffects(); });
 
     if ($("#fx-mode-slowed")) $("#fx-mode-slowed").addEventListener("click", () => {
@@ -3675,7 +3778,7 @@
         vocalRemove: false, vocalStrength: 100, vocalMode: "client",
         limiter: true, surround3d: 0, eqMode: "graphic",
         clarity: 0, vocalBoost: 0, subBass: 0, deEsser: 0,
-        warmth: 0, lofi: 0, echo: 0, echoTime: 350, chorus: 0, orbit8d: 0,
+        warmth: 0, lofi: 0, exciter: 0, phaser: 0, phaserRate: 5, bassComp: 0, echo: 0, echoTime: 350, chorus: 0, orbit8d: 0,
         balance: 0, mono: false, nightMode: false, loudnessComp: false,
         eqParam: EQ_FREQS.map((f, i) => ({
           type: i === 0 ? "lowshelf" : i === EQ_FREQS.length - 1 ? "highshelf" : "peaking",
